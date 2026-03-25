@@ -13,6 +13,8 @@ const {
 } = require("discord.js");
 
 const mineflayer = require("mineflayer");
+const fs         = require("fs");
+const path       = require("path");
 
 const client = new Client({
   intents: [
@@ -31,46 +33,89 @@ const REWARD_LOG_CHANNEL_ID = "1466514242558759278";
 const JOIN_LOG_CHANNEL_ID   = "1442916311532441662";
 const REWARD_PER_INVITE     = 5; // 1 invite = 5m
 const BOT_TOKEN             = process.env.BOT_TOKEN;
-
-// Minecraft bot credentials — set MC_USERNAME in Railway environment variables
-// MC_USERNAME = your Minecraft Java username (NOT email, just the in-game name e.g. "Steve")
-const MC_USERNAME = process.env.MC_USERNAME;
-const MC_HOST     = "donutsmp.net";
-const MC_PORT     = 25565;
+const MC_USERNAME           = process.env.MC_USERNAME;
+const MC_HOST               = "donutsmp.net";
+const MC_PORT               = 25565;
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ─── PERSISTENT STORAGE ───────────────────────────────────────────────────────
+// Railway has an ephemeral filesystem but /app is writable during the container's
+// lifetime. For true persistence across deploys, mount a Railway Volume at /data.
+// If no volume is mounted it still works — data just resets on redeploy (not restart).
+const DATA_DIR  = process.env.DATA_DIR || "/data";
+const DATA_FILE = path.join(DATA_DIR, "data.json");
+
+function ensureDataDir() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (e) {
+    console.warn("⚠️ Could not create data directory:", e.message);
+  }
+}
+
+function loadData() {
+  ensureDataDir();
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      console.log("📂 Loaded persistent data from", DATA_FILE);
+      return parsed;
+    }
+  } catch (e) {
+    console.warn("⚠️ Could not load data file:", e.message);
+  }
+  return {};
+}
+
+function saveData() {
+  ensureDataDir();
+  try {
+    const payload = {
+      userInvites,
+      claimedInvites,
+      pendingRewards,
+      joinedBefore:         [...joinedBefore],
+      rewardListMessageId,
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(payload, null, 2), "utf8");
+  } catch (e) {
+    console.warn("⚠️ Could not save data file:", e.message);
+  }
+}
+
+// Load saved data
+const saved = loadData();
+
+// total invites per user: { userId: number }
+const userInvites    = saved.userInvites    || {};
+
+// invites already paid out: { userId: number }
+const claimedInvites = saved.claimedInvites || {};
+
+// pending payout list: { userId: { ign, invites, discordTag } }
+let pendingRewards   = saved.pendingRewards || {};
+
+// everyone who has ever been in the server (rejoin detection)
+const joinedBefore   = new Set(saved.joinedBefore || []);
+
+// ID of the live payout-list message in REWARD_LOG_CHANNEL
+let rewardListMessageId = saved.rewardListMessageId || null;
 
 // ─── MINECRAFT BOT STATE ──────────────────────────────────────────────────────
-let mcBot   = null;  // the active mineflayer bot instance
-let mcReady = false; // true once the bot has spawned in-game
-
-// Queue of pay commands to run: [{ ign, amount }]
-let payQueue     = [];
-let payRunning   = false;
-// ──────────────────────────────────────────────────────────────────────────────
-
 // invite cache: guildId → { code: { uses, inviterId } }
 const inviteCache = new Map();
 
-// total invites per user: { userId: number }
-const userInvites = {};
-
-// invites already paid out: { userId: number }
-const claimedInvites = {};
-
-// pending payout list: { userId: { ign, invites, discordTag } }
-let pendingRewards = {};
-
-// everyone who has ever been in the server (rejoin detection)
-const joinedBefore = new Set();
-
-// ID of the live payout-list message in REWARD_LOG_CHANNEL
-let rewardListMessageId = null;
+let mcBot      = null;
+let mcReady    = false;
+let payQueue   = [];
+let payRunning = false;
+// ──────────────────────────────────────────────────────────────────────────────
 
 // ─── READY ────────────────────────────────────────────────────────────────────
 client.once("ready", async () => {
   console.log(`✅ ${client.user.tag} is online`);
 
-  // Auto-connect Minecraft bot on startup
   if (MC_USERNAME) {
     console.log("🎮 Auto-connecting Minecraft bot...");
     spawnMinecraftBot(null);
@@ -154,6 +199,8 @@ client.on("guildMemberAdd", async (member) => {
       } else {
         userInvites[inviterId] = (userInvites[inviterId] || 0) + 1;
         const total = userInvites[inviterId];
+        saveData();
+
         console.log(`📥 ${member.user.tag} joined via ${usedInvite.inviter.tag} — ${total} invite(s) total`);
 
         if (joinChannel) {
@@ -200,6 +247,7 @@ client.on("guildMemberAdd", async (member) => {
 // ─── MEMBER LEAVE ─────────────────────────────────────────────────────────────
 client.on("guildMemberRemove", async (member) => {
   joinedBefore.add(member.id);
+  saveData();
   try {
     const newInvites = await member.guild.invites.fetch();
     const updatedCache = {};
@@ -212,7 +260,7 @@ client.on("guildMemberRemove", async (member) => {
   }
 });
 
-// ─── COMMANDS (messageCreate) ─────────────────────────────────────────────────
+// ─── COMMANDS ─────────────────────────────────────────────────────────────────
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
@@ -254,14 +302,84 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ── !mcreconnect — manually force a reconnect ────────────────────────────
-  if (command === "!mcreconnect") {
+  // ── !addinvites @user amount ───────────────────────────────────────────────
+  // Manually add invites to a user (admin only)
+  if (command === "!addinvites") {
     if (!isAdmin) {
       const reply = await message.reply("❌ Only admins can use this command.");
       setTimeout(() => reply.delete().catch(() => {}), 5000);
       return;
     }
 
+    const mention = message.mentions.users.first();
+    const amount  = parseInt(args[2]);
+
+    if (!mention || isNaN(amount) || amount <= 0) {
+      const reply = await message.reply("❌ Usage: `!addinvites @user <amount>`\nExample: `!addinvites @David 5`");
+      setTimeout(() => reply.delete().catch(() => {}), 8000);
+      return;
+    }
+
+    userInvites[mention.id] = (userInvites[mention.id] || 0) + amount;
+    saveData();
+
+    await message.reply(
+      `✅ Added **${amount}** invite${amount === 1 ? "" : "s"} to <@${mention.id}>.\n` +
+      `They now have **${userInvites[mention.id]}** total invite${userInvites[mention.id] === 1 ? "" : "s"}.`
+    );
+    return;
+  }
+
+  // ── !removeinvites @user amount ───────────────────────────────────────────
+  // Manually remove invites from a user (admin only)
+  if (command === "!removeinvites") {
+    if (!isAdmin) {
+      const reply = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => reply.delete().catch(() => {}), 5000);
+      return;
+    }
+
+    const mention = message.mentions.users.first();
+    const amount  = parseInt(args[2]);
+
+    if (!mention || isNaN(amount) || amount <= 0) {
+      const reply = await message.reply("❌ Usage: `!removeinvites @user <amount>`");
+      setTimeout(() => reply.delete().catch(() => {}), 8000);
+      return;
+    }
+
+    userInvites[mention.id] = Math.max(0, (userInvites[mention.id] || 0) - amount);
+    saveData();
+
+    await message.reply(
+      `✅ Removed **${amount}** invite${amount === 1 ? "" : "s"} from <@${mention.id}>.\n` +
+      `They now have **${userInvites[mention.id]}** total invite${userInvites[mention.id] === 1 ? "" : "s"}.`
+    );
+    return;
+  }
+
+  // ── !checkinvites @user ────────────────────────────────────────────────────
+  if (command === "!checkinvites") {
+    if (!isAdmin) {
+      const reply = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => reply.delete().catch(() => {}), 5000);
+      return;
+    }
+
+    const mention = message.mentions.users.first() || message.author;
+    const total   = userInvites[mention.id]    || 0;
+    const claimed = claimedInvites[mention.id] || 0;
+
+    await message.reply(
+      `📊 **${mention.username}**\n` +
+      `Total invites: **${total}** | Claimed: **${claimed}** | Available: **${total - claimed}**`
+    );
+    return;
+  }
+
+  // ── !mcreconnect ───────────────────────────────────────────────────────────
+  if (command === "!mcreconnect") {
+    if (!isAdmin) return;
     await message.delete().catch(() => {});
     await spawnMinecraftBot(message.channel);
     return;
@@ -270,10 +388,8 @@ client.on("messageCreate", async (message) => {
   // ── !mcstatus ──────────────────────────────────────────────────────────────
   if (command === "!mcstatus") {
     if (!isAdmin) return;
-    if (!mcBot) {
-      await message.reply("🔴 Minecraft bot is **not connected**. Use `!spawn` to start it.");
-    } else if (!mcReady) {
-      await message.reply("🟡 Minecraft bot is **connecting...**");
+    if (!mcBot || !mcReady) {
+      await message.reply("🔴 Minecraft bot is **not connected**.");
     } else {
       await message.reply(`🟢 Minecraft bot is **online** as \`${mcBot.username}\` on \`${MC_HOST}:${MC_PORT}\``);
     }
@@ -287,9 +403,9 @@ client.on("messageCreate", async (message) => {
       mcBot.quit();
       mcBot   = null;
       mcReady = false;
-      await message.reply("✅ Minecraft bot has been disconnected.");
+      await message.reply("✅ Minecraft bot disconnected.");
     } else {
-      await message.reply("❌ No Minecraft bot is currently connected.");
+      await message.reply("❌ No Minecraft bot connected.");
     }
     return;
   }
@@ -304,33 +420,42 @@ async function spawnMinecraftBot(feedbackChannel) {
   }
 
   if (feedbackChannel) {
-    await feedbackChannel.send("🔄 Connecting Minecraft bot... Check your Microsoft account for a verification code if prompted!");
+    await feedbackChannel.send("🔄 Connecting Minecraft bot...");
+  }
+
+  // Microsoft auth token cache — persisted to DATA_DIR so login is only needed once
+  const authCacheDir = path.join(DATA_DIR, "auth_cache");
+  try {
+    if (!fs.existsSync(authCacheDir)) fs.mkdirSync(authCacheDir, { recursive: true });
+  } catch (e) {
+    console.warn("Could not create auth cache dir:", e.message);
   }
 
   try {
     mcBot = mineflayer.createBot({
-      host:     MC_HOST,
-      port:     MC_PORT,
-      username: MC_USERNAME,
-      auth:     "microsoft",
-      version:  "1.20.5",
+      host:           MC_HOST,
+      port:           MC_PORT,
+      username:       MC_USERNAME,
+      auth:           "microsoft",
+      version:        "1.20.5",
+      // Cache the Microsoft token so we never need to verify again after the first login
+      profilesFolder: authCacheDir,
     });
 
-    // Microsoft device code auth — send link to Discord or just log it
+    // Only fires the very first time — never again once token is cached
     mcBot.on("microsoftDeviceCode", async (data) => {
       const msg =
-        `🔐 **Microsoft Verification Required**\n\n` +
+        `🔐 **One-time Microsoft Verification**\n\n` +
         `1. Go to: **${data.verificationUri}**\n` +
         `2. Enter code: \`${data.userCode}\`\n` +
         `3. Sign in with the Microsoft account linked to your Minecraft Java account\n\n` +
-        `The bot will join automatically once verified!`;
+        `✅ After this you'll **never need to verify again** — the token is saved permanently!`;
 
-      console.log(`🔐 Microsoft verification needed — code: ${data.userCode} at ${data.verificationUri}`);
+      console.log(`🔐 Microsoft verification — code: ${data.userCode} at ${data.verificationUri}`);
 
       if (feedbackChannel) {
         await feedbackChannel.send(msg);
       } else {
-        // Find the reward log channel to post the verification message
         const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
         if (logChannel) await logChannel.send(msg);
       }
@@ -340,7 +465,7 @@ async function spawnMinecraftBot(feedbackChannel) {
       mcReady = true;
       console.log(`🎮 Minecraft bot spawned as ${mcBot.username} on ${MC_HOST}:${MC_PORT}`);
 
-      const successMsg = `✅ Minecraft bot **${mcBot.username}** has joined **${MC_HOST}** and is ready to pay rewards!`;
+      const successMsg = `✅ Minecraft bot **${mcBot.username}** is online on **${MC_HOST}** and ready to pay rewards!`;
       if (feedbackChannel) {
         await feedbackChannel.send(successMsg);
       } else {
@@ -348,20 +473,11 @@ async function spawnMinecraftBot(feedbackChannel) {
         if (logChannel) await logChannel.send(successMsg);
       }
 
-      // Simulate basic human behaviour so anti-bot doesn't kick us
-      // Look around slowly after spawning
-      setTimeout(() => {
-        if (mcBot && mcReady) {
-          mcBot.look(mcBot.entity.yaw + 0.3, mcBot.entity.pitch, false);
-        }
-      }, 2000);
-      setTimeout(() => {
-        if (mcBot && mcReady) {
-          mcBot.look(mcBot.entity.yaw - 0.1, 0, false);
-        }
-      }, 5000);
+      // Simulate slight human movement so anti-bot doesn't kick us
+      setTimeout(() => { if (mcBot && mcReady) mcBot.look(mcBot.entity.yaw + 0.3, mcBot.entity.pitch, false); }, 2000);
+      setTimeout(() => { if (mcBot && mcReady) mcBot.look(mcBot.entity.yaw - 0.1, 0, false); }, 5000);
 
-      // Process any queued payments that built up while offline
+      // Fire any queued payments
       if (payQueue.length > 0) {
         console.log(`⏳ Processing ${payQueue.length} queued payment(s)...`);
         runPayQueue();
@@ -370,7 +486,6 @@ async function spawnMinecraftBot(feedbackChannel) {
 
     mcBot.on("kicked", async (reason) => {
       mcReady = false;
-      // reason can be a string or a JSON chat object — convert it properly
       let reasonText = reason;
       try {
         const parsed = typeof reason === "string" ? JSON.parse(reason) : reason;
@@ -379,23 +494,21 @@ async function spawnMinecraftBot(feedbackChannel) {
 
       console.log(`⚠️ Minecraft bot was kicked: ${reasonText}`);
       const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
-      if (logChannel) await logChannel.send(`⚠️ Minecraft bot was **kicked**: \`${reasonText}\` — attempting reconnect in 60s...`);
+      if (logChannel) await logChannel.send(`⚠️ Minecraft bot was **kicked**: \`${reasonText}\` — reconnecting in 60s...`);
 
-      // Wait 60 seconds before reconnecting to avoid spam kicks
       mcBot = null;
       setTimeout(() => spawnMinecraftBot(null), 60000);
     });
 
-    mcBot.on("error", async (err) => {
+    mcBot.on("error", (err) => {
       mcReady = false;
       console.error("Minecraft bot error:", err.message);
     });
 
-    mcBot.on("end", async () => {
+    mcBot.on("end", () => {
       if (mcReady) {
-        // Only log if it was previously connected (not a manual quit)
         mcReady = false;
-        console.log("Minecraft bot disconnected — attempting reconnect in 30s...");
+        console.log("Minecraft bot disconnected — reconnecting in 30s...");
         setTimeout(() => spawnMinecraftBot(null), 30000);
       }
     });
@@ -406,7 +519,7 @@ async function spawnMinecraftBot(feedbackChannel) {
   }
 }
 
-// ─── Run pay queue (one command every 1.5 seconds to avoid spam kick) ─────────
+// ─── Run pay queue ─────────────────────────────────────────────────────────────
 async function runPayQueue() {
   if (payRunning || payQueue.length === 0) return;
   payRunning = true;
@@ -427,7 +540,6 @@ async function runPayQueue() {
       console.error(`Failed to send pay command for ${ign}:`, e.message);
     }
 
-    // Wait 1.5s between commands so the server doesn't kick the bot for spam
     await new Promise((r) => setTimeout(r, 1500));
   }
 
@@ -492,6 +604,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     pendingRewards[userId] = { ign, invites: claimable, discordTag };
+    saveData();
     await updateRewardList(interaction.client, interaction.guild);
 
     await interaction.editReply({
@@ -524,20 +637,17 @@ client.on("interactionCreate", async (interaction) => {
     const data   = pendingRewards[targetId];
     const amount = data.invites * REWARD_PER_INVITE;
 
-    if (!mcBot || !mcReady) {
-      await interaction.reply({
-        content: `⚠️ Minecraft bot is not online! Payment queued for **${data.ign}** (${amount}m).\nUse \`!spawn\` to connect the bot and it will pay automatically.`,
-        ephemeral: true,
-      });
-      payQueue.push({ ign: data.ign, amount });
-    } else {
-      payQueue.push({ ign: data.ign, amount });
-      runPayQueue();
-      await interaction.reply({ content: `✅ Paying **${data.ign}** ${amount}m in-game now!`, ephemeral: true });
-    }
+    payQueue.push({ ign: data.ign, amount });
+    if (mcBot && mcReady) runPayQueue();
 
     await payUser(interaction.client, interaction.guild, targetId);
     await updateRewardList(interaction.client, interaction.guild);
+
+    const status = (!mcBot || !mcReady)
+      ? `⚠️ MC bot offline — payment queued for when it reconnects.`
+      : `✅ Paying **${data.ign}** ${amount}m in-game now!`;
+
+    await interaction.reply({ content: status, ephemeral: true });
     return;
   }
 
@@ -557,30 +667,24 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // Queue all payments
     for (const uid of all) {
       const data   = pendingRewards[uid];
       const amount = data.invites * REWARD_PER_INVITE;
       payQueue.push({ ign: data.ign, amount });
     }
 
-    const botStatus = (!mcBot || !mcReady)
-      ? `\n\n⚠️ Minecraft bot is **offline** — payments have been queued. Use \`!spawn\` to connect it and they'll be sent automatically.`
-      : "";
-
-    // Pay everyone (DM + clear list)
     for (const uid of all) {
       await payUser(interaction.client, interaction.guild, uid);
     }
 
     await updateRewardList(interaction.client, interaction.guild);
-
     if (mcBot && mcReady) runPayQueue();
 
-    await interaction.reply({
-      content: `✅ Queued ${all.length} payment(s) — in-game commands are being sent now!${botStatus}`,
-      ephemeral: true,
-    });
+    const status = (!mcBot || !mcReady)
+      ? `✅ ${all.length} payment(s) queued — will be sent when MC bot reconnects.`
+      : `✅ Paying ${all.length} player(s) in-game now!`;
+
+    await interaction.reply({ content: status, ephemeral: true });
     return;
   }
 });
@@ -591,6 +695,8 @@ async function payUser(client, guild, userId) {
   if (!data) return;
 
   claimedInvites[userId] = (claimedInvites[userId] || 0) + data.invites;
+  delete pendingRewards[userId];
+  saveData();
 
   try {
     const member = await guild.members.fetch(userId);
@@ -604,8 +710,6 @@ async function payUser(client, guild, userId) {
   } catch {
     console.log(`⚠️ Could not DM ${userId}`);
   }
-
-  delete pendingRewards[userId];
 }
 
 // ─── Build / update the payout list ──────────────────────────────────────────
@@ -670,12 +774,13 @@ async function updateRewardList(client, guild) {
       await existing.edit({ embeds: [embed], components });
       return;
     } catch {
-      // message deleted, send new
+      // message was deleted, send new one
     }
   }
 
   const sent = await logChannel.send({ embeds: [embed], components });
   rewardListMessageId = sent.id;
+  saveData();
 }
 
 function chunkArray(arr, size) {
