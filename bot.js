@@ -27,6 +27,7 @@ const client = new Client({
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const REWARD_LOG_CHANNEL_ID = "1466514242558759278";
 const JOIN_LOG_CHANNEL_ID = "1442916311532441662";
+const FAKE_INVITE_CHANNEL_ID = "1442923076147744838";
 const REWARD_PER_INVITE = 5; // 1 invite = 5m
 const BOT_TOKEN = process.env.BOT_TOKEN;
 // ──────────────────────────────────────────────────────────────────────────────
@@ -43,6 +44,9 @@ const claimedInvites = {};
 // pending reward list: { userId: { ign, invites, discordTag } }
 let pendingRewards = {};
 
+// set of userIds who have ever joined — used for rejoin/fake invite detection
+const joinedBefore = new Set();
+
 // message ID of the reward list in the log channel
 let rewardListMessageId = null;
 
@@ -52,6 +56,7 @@ client.once("ready", async () => {
 
   for (const guild of client.guilds.cache.values()) {
     try {
+      // Cache all existing invites
       const invites = await guild.invites.fetch();
       const cache = {};
       invites.forEach((inv) => {
@@ -59,8 +64,13 @@ client.once("ready", async () => {
       });
       inviteCache.set(guild.id, cache);
       console.log(`📋 Cached ${invites.size} invites for ${guild.name}`);
+
+      // Cache all current members so rejoins are detected even after a restart
+      const members = await guild.members.fetch();
+      members.forEach((m) => joinedBefore.add(m.id));
+      console.log(`👥 Cached ${members.size} existing members for rejoin detection`);
     } catch (e) {
-      console.error(`Could not cache invites for guild ${guild.id}:`, e.message);
+      console.error(`Could not cache data for guild ${guild.id}:`, e.message);
     }
   }
 });
@@ -100,38 +110,84 @@ client.on("guildMemberAdd", async (member) => {
 
     const joinChannel = await member.guild.channels.fetch(JOIN_LOG_CHANNEL_ID).catch(() => null);
 
+    const isRejoin = joinedBefore.has(member.id);
+    joinedBefore.add(member.id);
+
     if (usedInvite && usedInvite.inviter) {
       const inviterId = usedInvite.inviter.id;
-      userInvites[inviterId] = (userInvites[inviterId] || 0) + 1;
-      const totalInvites = userInvites[inviterId];
 
-      console.log(
-        `📥 ${member.user.tag} joined via ${usedInvite.inviter.tag}'s invite. ` +
-        `They now have ${totalInvites} total invite(s).`
-      );
+      if (isRejoin) {
+        // Rejoin detected — don't count the invite
+        console.log(`⚠️ ${member.user.tag} rejoined — not counting invite for ${usedInvite.inviter.tag}.`);
 
-      if (joinChannel) {
-        const embed = new EmbedBuilder()
-          .setColor(0x57f287)
-          .setTitle("👋 New Member Joined!")
-          .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-          .setDescription(
-            `<@${member.id}> has been invited by <@${inviterId}>\n` +
-            `<@${inviterId}> now has **${totalInvites}** invite${totalInvites === 1 ? "" : "s"}.`
-          )
-          .setFooter({ text: `Member #${member.guild.memberCount}` })
-          .setTimestamp();
+        if (joinChannel) {
+          const embed = new EmbedBuilder()
+            .setColor(0xed4245)
+            .setTitle("🔄 Member Rejoined")
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+            .setDescription(
+              `<@${member.id}> rejoined the server.\n` +
+              `⚠️ This was **not counted** as an invite for <@${inviterId}> (rejoin detected).`
+            )
+            .setFooter({ text: `Member #${member.guild.memberCount}` })
+            .setTimestamp();
 
-        await joinChannel.send({ embeds: [embed] });
+          await joinChannel.send({ embeds: [embed] });
+        }
+
+        // Alert the fake invite channel
+        const fakeChannel = await member.guild.channels.fetch(FAKE_INVITE_CHANNEL_ID).catch(() => null);
+        if (fakeChannel) {
+          const fakeEmbed = new EmbedBuilder()
+            .setColor(0xed4245)
+            .setTitle("🚨 Fake Invite Detected")
+            .setDescription(
+              `<@${usedInvite.inviter.id}> tried to get credit for a fake invite.\n\n` +
+              `**Rejoined user:** <@${member.id}> (${member.user.tag})\n` +
+              `**Inviter:** <@${usedInvite.inviter.id}> (${usedInvite.inviter.tag})\n\n` +
+              `⚠️ This invite was **not counted**.`
+            )
+            .setTimestamp();
+
+          await fakeChannel.send({ embeds: [fakeEmbed] });
+        }
+      } else {
+        // Fresh join — count it
+        userInvites[inviterId] = (userInvites[inviterId] || 0) + 1;
+        const totalInvites = userInvites[inviterId];
+
+        console.log(
+          `📥 ${member.user.tag} joined via ${usedInvite.inviter.tag}'s invite. ` +
+          `They now have ${totalInvites} total invite(s).`
+        );
+
+        if (joinChannel) {
+          const embed = new EmbedBuilder()
+            .setColor(0x57f287)
+            .setTitle("👋 New Member Joined!")
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+            .setDescription(
+              `<@${member.id}> has been invited by <@${inviterId}>\n` +
+              `<@${inviterId}> now has **${totalInvites}** invite${totalInvites === 1 ? "" : "s"}.`
+            )
+            .setFooter({ text: `Member #${member.guild.memberCount}` })
+            .setTimestamp();
+
+          await joinChannel.send({ embeds: [embed] });
+        }
       }
     } else {
       // Couldn't detect inviter (vanity URL, widget, etc.)
       if (joinChannel) {
         const embed = new EmbedBuilder()
           .setColor(0xfee75c)
-          .setTitle("👋 New Member Joined!")
+          .setTitle(isRejoin ? "🔄 Member Rejoined" : "👋 New Member Joined!")
           .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-          .setDescription(`<@${member.id}> joined but the inviter couldn't be detected.`)
+          .setDescription(
+            isRejoin
+              ? `<@${member.id}> rejoined but the inviter couldn't be detected.`
+              : `<@${member.id}> joined but the inviter couldn't be detected.`
+          )
           .setFooter({ text: `Member #${member.guild.memberCount}` })
           .setTimestamp();
 
@@ -145,6 +201,8 @@ client.on("guildMemberAdd", async (member) => {
 
 // ─── Member leaves → update cache ────────────────────────────────────────────
 client.on("guildMemberRemove", async (member) => {
+  // Keep them in joinedBefore so if they rejoin it's detected as a rejoin
+  joinedBefore.add(member.id);
   try {
     const newInvites = await member.guild.invites.fetch();
     const updatedCache = {};
