@@ -348,6 +348,19 @@ async function spawnMinecraftBot(feedbackChannel) {
         if (logChannel) await logChannel.send(successMsg);
       }
 
+      // Simulate basic human behaviour so anti-bot doesn't kick us
+      // Look around slowly after spawning
+      setTimeout(() => {
+        if (mcBot && mcReady) {
+          mcBot.look(mcBot.entity.yaw + 0.3, mcBot.entity.pitch, false);
+        }
+      }, 2000);
+      setTimeout(() => {
+        if (mcBot && mcReady) {
+          mcBot.look(mcBot.entity.yaw - 0.1, 0, false);
+        }
+      }, 5000);
+
       // Process any queued payments that built up while offline
       if (payQueue.length > 0) {
         console.log(`⏳ Processing ${payQueue.length} queued payment(s)...`);
@@ -357,12 +370,20 @@ async function spawnMinecraftBot(feedbackChannel) {
 
     mcBot.on("kicked", async (reason) => {
       mcReady = false;
-      console.log(`⚠️ Minecraft bot was kicked: ${reason}`);
-      const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
-      if (logChannel) await logChannel.send(`⚠️ Minecraft bot was **kicked**: \`${reason}\` — attempting reconnect in 30s...`);
+      // reason can be a string or a JSON chat object — convert it properly
+      let reasonText = reason;
+      try {
+        const parsed = typeof reason === "string" ? JSON.parse(reason) : reason;
+        reasonText = parsed?.text || parsed?.translate || JSON.stringify(parsed);
+      } catch { reasonText = String(reason); }
 
-      // Auto-reconnect after 30 seconds
-      setTimeout(() => spawnMinecraftBot(null), 30000);
+      console.log(`⚠️ Minecraft bot was kicked: ${reasonText}`);
+      const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+      if (logChannel) await logChannel.send(`⚠️ Minecraft bot was **kicked**: \`${reasonText}\` — attempting reconnect in 60s...`);
+
+      // Wait 60 seconds before reconnecting to avoid spam kicks
+      mcBot = null;
+      setTimeout(() => spawnMinecraftBot(null), 60000);
     });
 
     mcBot.on("error", async (err) => {
