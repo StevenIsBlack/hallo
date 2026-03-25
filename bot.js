@@ -12,6 +12,8 @@ const {
   PermissionFlagsBits,
 } = require("discord.js");
 
+const mineflayer = require("mineflayer");
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -26,82 +28,98 @@ const client = new Client({
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const REWARD_LOG_CHANNEL_ID = "1466514242558759278";
-const JOIN_LOG_CHANNEL_ID = "1442916311532441662";
-const FAKE_INVITE_CHANNEL_ID = "1442923076147744838";
-const REWARD_PER_INVITE = 5; // 1 invite = 5m
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const JOIN_LOG_CHANNEL_ID   = "1442916311532441662";
+const REWARD_PER_INVITE     = 5; // 1 invite = 5m
+const BOT_TOKEN             = process.env.BOT_TOKEN;
+
+// Minecraft bot credentials — set these as Railway environment variables
+const MC_EMAIL    = process.env.MC_EMAIL;    // your Minecraft account email
+const MC_PASSWORD = process.env.MC_PASSWORD; // your Minecraft account password
+const MC_HOST     = "donutsmp.net";
+const MC_PORT     = 25565;
 // ──────────────────────────────────────────────────────────────────────────────
 
-// invite tracking: guildId -> { inviteCode: { uses, inviterId } }
+// ─── MINECRAFT BOT STATE ──────────────────────────────────────────────────────
+let mcBot   = null;  // the active mineflayer bot instance
+let mcReady = false; // true once the bot has spawned in-game
+
+// Queue of pay commands to run: [{ ign, amount }]
+let payQueue     = [];
+let payRunning   = false;
+// ──────────────────────────────────────────────────────────────────────────────
+
+// invite cache: guildId → { code: { uses, inviterId } }
 const inviteCache = new Map();
 
-// total invites earned per user: { userId: number }
+// total invites per user: { userId: number }
 const userInvites = {};
 
-// invites already claimed for rewards: { userId: number }
+// invites already paid out: { userId: number }
 const claimedInvites = {};
 
-// pending reward list: { userId: { ign, invites, discordTag } }
+// pending payout list: { userId: { ign, invites, discordTag } }
 let pendingRewards = {};
 
-// set of userIds who have ever joined — used for rejoin/fake invite detection
+// everyone who has ever been in the server (rejoin detection)
 const joinedBefore = new Set();
 
-// message ID of the reward list in the log channel
+// ID of the live payout-list message in REWARD_LOG_CHANNEL
 let rewardListMessageId = null;
 
-// ─── READY: cache all current invites ────────────────────────────────────────
+// ─── READY ────────────────────────────────────────────────────────────────────
 client.once("ready", async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`✅ ${client.user.tag} is online`);
+
+  // Auto-connect Minecraft bot on startup
+  if (MC_EMAIL && MC_PASSWORD) {
+    console.log("🎮 Auto-connecting Minecraft bot...");
+    spawnMinecraftBot(null);
+  } else {
+    console.warn("⚠️ MC_EMAIL or MC_PASSWORD not set — Minecraft bot won't connect.");
+  }
 
   for (const guild of client.guilds.cache.values()) {
     try {
-      // Cache all existing invites
       const invites = await guild.invites.fetch();
       const cache = {};
       invites.forEach((inv) => {
         cache[inv.code] = { uses: inv.uses, inviterId: inv.inviter?.id };
       });
       inviteCache.set(guild.id, cache);
-      console.log(`📋 Cached ${invites.size} invites for ${guild.name}`);
 
-      // Cache all current members so rejoins are detected even after a restart
       const members = await guild.members.fetch();
       members.forEach((m) => joinedBefore.add(m.id));
-      console.log(`👥 Cached ${members.size} existing members for rejoin detection`);
+      console.log(`📋 ${guild.name}: ${invites.size} invites, ${members.size} members cached`);
     } catch (e) {
-      console.error(`Could not cache data for guild ${guild.id}:`, e.message);
+      console.error(`Cache error for guild ${guild.id}:`, e.message);
     }
   }
 });
 
-// ─── New invite created ───────────────────────────────────────────────────────
+// ─── INVITE CREATED / DELETED ─────────────────────────────────────────────────
 client.on("inviteCreate", (invite) => {
   const cache = inviteCache.get(invite.guild.id) || {};
   cache[invite.code] = { uses: invite.uses, inviterId: invite.inviter?.id };
   inviteCache.set(invite.guild.id, cache);
 });
 
-// ─── Invite deleted ───────────────────────────────────────────────────────────
 client.on("inviteDelete", (invite) => {
   const cache = inviteCache.get(invite.guild.id) || {};
   delete cache[invite.code];
   inviteCache.set(invite.guild.id, cache);
 });
 
-// ─── Member joins → detect who invited them ──────────────────────────────────
+// ─── MEMBER JOIN ──────────────────────────────────────────────────────────────
 client.on("guildMemberAdd", async (member) => {
   try {
     const newInvites = await member.guild.invites.fetch();
-    const oldCache = inviteCache.get(member.guild.id) || {};
+    const oldCache   = inviteCache.get(member.guild.id) || {};
 
-    // Find the invite whose use count increased
     const usedInvite = newInvites.find((inv) => {
       const old = oldCache[inv.code];
       return old && inv.uses > old.uses;
     });
 
-    // Update the cache to reflect new use counts
     const updatedCache = {};
     newInvites.forEach((inv) => {
       updatedCache[inv.code] = { uses: inv.uses, inviterId: inv.inviter?.id };
@@ -109,99 +127,78 @@ client.on("guildMemberAdd", async (member) => {
     inviteCache.set(member.guild.id, updatedCache);
 
     const joinChannel = await member.guild.channels.fetch(JOIN_LOG_CHANNEL_ID).catch(() => null);
-
-    const isRejoin = joinedBefore.has(member.id);
+    const isRejoin    = joinedBefore.has(member.id);
     joinedBefore.add(member.id);
 
     if (usedInvite && usedInvite.inviter) {
       const inviterId = usedInvite.inviter.id;
 
       if (isRejoin) {
-        // Rejoin detected — don't count the invite
-        console.log(`⚠️ ${member.user.tag} rejoined — not counting invite for ${usedInvite.inviter.tag}.`);
-
+        console.log(`⚠️ Rejoin: ${member.user.tag} — NOT counted for ${usedInvite.inviter.tag}`);
         if (joinChannel) {
-          const embed = new EmbedBuilder()
-            .setColor(0xed4245)
-            .setTitle("🔄 Member Rejoined")
-            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-            .setDescription(
-              `<@${member.id}> rejoined the server.\n` +
-              `⚠️ This was **not counted** as an invite for <@${inviterId}> (rejoin detected).`
-            )
-            .setFooter({ text: `Member #${member.guild.memberCount}` })
-            .setTimestamp();
-
-          await joinChannel.send({ embeds: [embed] });
-        }
-
-        // Alert the fake invite channel
-        const fakeChannel = await member.guild.channels.fetch(FAKE_INVITE_CHANNEL_ID).catch(() => null);
-        if (fakeChannel) {
-          const fakeEmbed = new EmbedBuilder()
-            .setColor(0xed4245)
-            .setTitle("🚨 Fake Invite Detected")
-            .setDescription(
-              `<@${usedInvite.inviter.id}> tried to get credit for a fake invite.\n\n` +
-              `**Rejoined user:** <@${member.id}> (${member.user.tag})\n` +
-              `**Inviter:** <@${usedInvite.inviter.id}> (${usedInvite.inviter.tag})\n\n` +
-              `⚠️ This invite was **not counted**.`
-            )
-            .setTimestamp();
-
-          await fakeChannel.send({ embeds: [fakeEmbed] });
+          await joinChannel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xed4245)
+                .setTitle("🔄 Player Rejoined — Invite Not Counted")
+                .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+                .setDescription(
+                  `**${member.user.username}** rejoined the server.\n` +
+                  `⚠️ Invite was **not counted** for <@${inviterId}> — rejoin detected.`
+                )
+                .setFooter({ text: `Members: ${member.guild.memberCount}` })
+                .setTimestamp(),
+            ],
+          });
         }
       } else {
-        // Fresh join — count it
         userInvites[inviterId] = (userInvites[inviterId] || 0) + 1;
-        const totalInvites = userInvites[inviterId];
-
-        console.log(
-          `📥 ${member.user.tag} joined via ${usedInvite.inviter.tag}'s invite. ` +
-          `They now have ${totalInvites} total invite(s).`
-        );
+        const total = userInvites[inviterId];
+        console.log(`📥 ${member.user.tag} joined via ${usedInvite.inviter.tag} — ${total} invite(s) total`);
 
         if (joinChannel) {
-          const embed = new EmbedBuilder()
-            .setColor(0x57f287)
-            .setTitle("👋 New Member Joined!")
-            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-            .setDescription(
-              `<@${member.id}> has been invited by <@${inviterId}>\n` +
-              `<@${inviterId}> now has **${totalInvites}** invite${totalInvites === 1 ? "" : "s"}.`
-            )
-            .setFooter({ text: `Member #${member.guild.memberCount}` })
-            .setTimestamp();
-
-          await joinChannel.send({ embeds: [embed] });
+          await joinChannel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0x57f287)
+                .setTitle("👋 New Member Joined!")
+                .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+                .setDescription(
+                  `**${member.user.username}** was invited by <@${inviterId}>\n` +
+                  `<@${inviterId}> now has **${total}** invite${total === 1 ? "" : "s"}.`
+                )
+                .setFooter({ text: `Members: ${member.guild.memberCount}` })
+                .setTimestamp(),
+            ],
+          });
         }
       }
     } else {
-      // Couldn't detect inviter (vanity URL, widget, etc.)
       if (joinChannel) {
-        const embed = new EmbedBuilder()
-          .setColor(0xfee75c)
-          .setTitle(isRejoin ? "🔄 Member Rejoined" : "👋 New Member Joined!")
-          .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-          .setDescription(
-            isRejoin
-              ? `<@${member.id}> rejoined but the inviter couldn't be detected.`
-              : `<@${member.id}> joined but the inviter couldn't be detected.`
-          )
-          .setFooter({ text: `Member #${member.guild.memberCount}` })
-          .setTimestamp();
-
-        await joinChannel.send({ embeds: [embed] });
+        await joinChannel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xfee75c)
+              .setTitle(isRejoin ? "🔄 Player Rejoined" : "👋 New Member Joined!")
+              .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+              .setDescription(
+                isRejoin
+                  ? `**${member.user.username}** rejoined — inviter unknown.`
+                  : `**${member.user.username}** joined — inviter couldn't be detected.`
+              )
+              .setFooter({ text: `Members: ${member.guild.memberCount}` })
+              .setTimestamp(),
+          ],
+        });
       }
     }
   } catch (e) {
-    console.error("Error tracking invite on member join:", e.message);
+    console.error("guildMemberAdd error:", e.message);
   }
 });
 
-// ─── Member leaves → update cache ────────────────────────────────────────────
+// ─── MEMBER LEAVE ─────────────────────────────────────────────────────────────
 client.on("guildMemberRemove", async (member) => {
-  // Keep them in joinedBefore so if they rejoin it's detected as a rejoin
   joinedBefore.add(member.id);
   try {
     const newInvites = await member.guild.invites.fetch();
@@ -211,118 +208,284 @@ client.on("guildMemberRemove", async (member) => {
     });
     inviteCache.set(member.guild.id, updatedCache);
   } catch (e) {
-    console.error("Error updating cache on member remove:", e.message);
+    console.error("guildMemberRemove error:", e.message);
   }
 });
 
-// ─── !reward COMMAND ──────────────────────────────────────────────────────────
+// ─── COMMANDS (messageCreate) ─────────────────────────────────────────────────
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
-  if (message.content.toLowerCase() !== "!reward") return;
 
-  if (
-    !message.member.permissions.has(PermissionFlagsBits.Administrator) &&
-    message.guild.ownerId !== message.author.id
-  ) {
-    const reply = await message.reply("❌ You don't have permission to use this command.");
-    setTimeout(() => reply.delete().catch(() => {}), 5000);
+  const isAdmin =
+    message.member?.permissions.has(PermissionFlagsBits.Administrator) ||
+    message.guild?.ownerId === message.author.id;
+
+  const args    = message.content.trim().split(/\s+/);
+  const command = args[0].toLowerCase();
+
+  // ── !reward ────────────────────────────────────────────────────────────────
+  if (command === "!reward") {
+    if (!isAdmin) {
+      const reply = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => reply.delete().catch(() => {}), 5000);
+      return;
+    }
+
+    await message.delete().catch(() => {});
+
+    const embed = new EmbedBuilder()
+      .setColor(0x00c8ff)
+      .setTitle("🎁 Invite Rewards")
+      .setDescription(
+        `Have you invited people to the server? Click **Claim Rewards** below!\n\n` +
+        `**Rate:** 1 invite = ${REWARD_PER_INVITE}m\n\n` +
+        `Your invite count is checked **automatically** — just enter your Minecraft IGN.`
+      )
+      .setFooter({ text: "Invite Rewards System" });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("claim_reward")
+        .setLabel("🎁 Claim Rewards")
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await message.channel.send({ embeds: [embed], components: [row] });
     return;
   }
 
-  await message.delete().catch(() => {});
+  // ── !mcreconnect — manually force a reconnect ────────────────────────────
+  if (command === "!mcreconnect") {
+    if (!isAdmin) {
+      const reply = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => reply.delete().catch(() => {}), 5000);
+      return;
+    }
 
-  const embed = new EmbedBuilder()
-    .setTitle("🎁 Invite Rewards")
-    .setDescription(
-      `Have you invited people to the server? Click **Claim Rewards** below!\n\n` +
-      `**Rate:** 1 invite = ${REWARD_PER_INVITE}m\n\n` +
-      `Your invite count is checked **automatically** — just enter your IGN.`
-    )
-    .setColor(0x00c8ff)
-    .setFooter({ text: "Invite Rewards System" });
+    await message.delete().catch(() => {});
+    await spawnMinecraftBot(message.channel);
+    return;
+  }
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("claim_reward")
-      .setLabel("🎁 Claim Rewards")
-      .setStyle(ButtonStyle.Primary)
-  );
+  // ── !mcstatus ──────────────────────────────────────────────────────────────
+  if (command === "!mcstatus") {
+    if (!isAdmin) return;
+    if (!mcBot) {
+      await message.reply("🔴 Minecraft bot is **not connected**. Use `!spawn` to start it.");
+    } else if (!mcReady) {
+      await message.reply("🟡 Minecraft bot is **connecting...**");
+    } else {
+      await message.reply(`🟢 Minecraft bot is **online** as \`${mcBot.username}\` on \`${MC_HOST}:${MC_PORT}\``);
+    }
+    return;
+  }
 
-  await message.channel.send({ embeds: [embed], components: [row] });
+  // ── !mckick ────────────────────────────────────────────────────────────────
+  if (command === "!mckick") {
+    if (!isAdmin) return;
+    if (mcBot) {
+      mcBot.quit();
+      mcBot   = null;
+      mcReady = false;
+      await message.reply("✅ Minecraft bot has been disconnected.");
+    } else {
+      await message.reply("❌ No Minecraft bot is currently connected.");
+    }
+    return;
+  }
 });
+
+// ─── Spawn the Mineflayer bot ─────────────────────────────────────────────────
+async function spawnMinecraftBot(feedbackChannel) {
+  if (mcBot) {
+    mcBot.quit();
+    mcBot   = null;
+    mcReady = false;
+  }
+
+  if (feedbackChannel) {
+    await feedbackChannel.send("🔄 Connecting Minecraft bot... Check your Microsoft account for a verification code if prompted!");
+  }
+
+  try {
+    mcBot = mineflayer.createBot({
+      host:     MC_HOST,
+      port:     MC_PORT,
+      username: MC_EMAIL,
+      password: MC_PASSWORD,
+      auth:     "microsoft",
+      version:  false, // auto-detect server version
+    });
+
+    // Microsoft device code auth — send link to Discord or just log it
+    mcBot.on("microsoftDeviceCode", async (data) => {
+      const msg =
+        `🔐 **Microsoft Verification Required**\n\n` +
+        `1. Go to: **${data.verificationUri}**\n` +
+        `2. Enter code: \`${data.userCode}\`\n` +
+        `3. Sign in with your Microsoft account\n\n` +
+        `The bot will join automatically once verified!`;
+
+      console.log(`🔐 Microsoft verification needed — code: ${data.userCode} at ${data.verificationUri}`);
+
+      if (feedbackChannel) {
+        await feedbackChannel.send(msg);
+      } else {
+        // Find the reward log channel to post the verification message
+        const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (logChannel) await logChannel.send(msg);
+      }
+    });
+
+    mcBot.once("spawn", async () => {
+      mcReady = true;
+      console.log(`🎮 Minecraft bot spawned as ${mcBot.username} on ${MC_HOST}:${MC_PORT}`);
+
+      const successMsg = `✅ Minecraft bot **${mcBot.username}** has joined **${MC_HOST}** and is ready to pay rewards!`;
+      if (feedbackChannel) {
+        await feedbackChannel.send(successMsg);
+      } else {
+        const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (logChannel) await logChannel.send(successMsg);
+      }
+
+      // Process any queued payments that built up while offline
+      if (payQueue.length > 0) {
+        console.log(`⏳ Processing ${payQueue.length} queued payment(s)...`);
+        runPayQueue();
+      }
+    });
+
+    mcBot.on("kicked", async (reason) => {
+      mcReady = false;
+      console.log(`⚠️ Minecraft bot was kicked: ${reason}`);
+      const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+      if (logChannel) await logChannel.send(`⚠️ Minecraft bot was **kicked**: \`${reason}\` — attempting reconnect in 30s...`);
+
+      // Auto-reconnect after 30 seconds
+      setTimeout(() => spawnMinecraftBot(null), 30000);
+    });
+
+    mcBot.on("error", async (err) => {
+      mcReady = false;
+      console.error("Minecraft bot error:", err.message);
+    });
+
+    mcBot.on("end", async () => {
+      if (mcReady) {
+        // Only log if it was previously connected (not a manual quit)
+        mcReady = false;
+        console.log("Minecraft bot disconnected — attempting reconnect in 30s...");
+        setTimeout(() => spawnMinecraftBot(null), 30000);
+      }
+    });
+
+  } catch (e) {
+    console.error("Failed to start Minecraft bot:", e.message);
+    if (feedbackChannel) await feedbackChannel.send(`❌ Failed to start Minecraft bot: \`${e.message}\``);
+  }
+}
+
+// ─── Run pay queue (one command every 1.5 seconds to avoid spam kick) ─────────
+async function runPayQueue() {
+  if (payRunning || payQueue.length === 0) return;
+  payRunning = true;
+
+  while (payQueue.length > 0) {
+    if (!mcBot || !mcReady) {
+      console.log("⚠️ MC bot not ready — pausing pay queue");
+      break;
+    }
+
+    const { ign, amount } = payQueue.shift();
+    const cmd = `/pay ${ign} ${amount}m`;
+
+    try {
+      mcBot.chat(cmd);
+      console.log(`💰 Sent: ${cmd}`);
+    } catch (e) {
+      console.error(`Failed to send pay command for ${ign}:`, e.message);
+    }
+
+    // Wait 1.5s between commands so the server doesn't kick the bot for spam
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+
+  payRunning = false;
+}
 
 // ─── INTERACTIONS ─────────────────────────────────────────────────────────────
 client.on("interactionCreate", async (interaction) => {
 
-  // ── Claim button → show modal ─────────────────────────────────────────────
+  // ── Claim button → modal ───────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "claim_reward") {
     const modal = new ModalBuilder()
       .setCustomId("reward_modal")
       .setTitle("Claim Your Invite Rewards");
 
-    const ignInput = new TextInputBuilder()
-      .setCustomId("ign")
-      .setLabel("Your In-Game Username")
-      .setStyle(TextInputStyle.Short)
-      .setPlaceholder("Enter your IGN...")
-      .setRequired(true);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("ign")
+          .setLabel("Your Minecraft Username")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("e.g. Steve")
+          .setRequired(true)
+      )
+    );
 
-    modal.addComponents(new ActionRowBuilder().addComponents(ignInput));
     await interaction.showModal(modal);
     return;
   }
 
-  // ── Modal submit ──────────────────────────────────────────────────────────
+  // ── Modal submit ───────────────────────────────────────────────────────────
   if (interaction.isModalSubmit() && interaction.customId === "reward_modal") {
     await interaction.deferReply({ ephemeral: true });
 
-    const ign = interaction.fields.getTextInputValue("ign").trim();
-    const userId = interaction.user.id;
+    const ign        = interaction.fields.getTextInputValue("ign").trim();
+    const userId     = interaction.user.id;
     const discordTag = interaction.user.tag;
 
-    const totalInvites = userInvites[userId] || 0;
-    const alreadyClaimed = claimedInvites[userId] || 0;
-    const claimableInvites = totalInvites - alreadyClaimed;
+    const total     = userInvites[userId]    || 0;
+    const claimed   = claimedInvites[userId] || 0;
+    const claimable = total - claimed;
 
-    // Already has a pending claim
     if (pendingRewards[userId]) {
+      const p = pendingRewards[userId];
       await interaction.editReply({
         content:
-          `⏳ You already have a pending reward claim for **${pendingRewards[userId].invites} invite(s)**.\n` +
-          `Please wait for it to be paid before claiming again.`,
+          `⏳ You already have a pending claim!\n\n` +
+          `**IGN:** ${p.ign} | **Invites:** ${p.invites} | **Reward:** ${p.invites * REWARD_PER_INVITE}m\n\n` +
+          `Wait for it to be paid before claiming again.`,
       });
       return;
     }
 
-    // Not enough invites
-    if (claimableInvites <= 0) {
+    if (claimable <= 0) {
       await interaction.editReply({
         content:
-          `❌ You don't have any unclaimed invites.\n\n` +
-          `**Your total invites:** ${totalInvites}\n` +
-          `**Already claimed:** ${alreadyClaimed}\n\n` +
-          `Invite more people to the server to earn rewards!`,
+          `❌ You have no unclaimed invites.\n\n` +
+          `📊 Total invites: **${total}** | Already claimed: **${claimed}**\n\n` +
+          `Invite more players to earn rewards!`,
       });
       return;
     }
 
-    // Save the pending claim
-    pendingRewards[userId] = { ign, invites: claimableInvites, discordTag };
-
+    pendingRewards[userId] = { ign, invites: claimable, discordTag };
     await updateRewardList(interaction.client, interaction.guild);
 
     await interaction.editReply({
       content:
-        `✅ Reward claim submitted!\n\n` +
-        `**IGN:** ${ign}\n` +
-        `**Invites:** ${claimableInvites}\n` +
-        `**Reward:** ${claimableInvites * REWARD_PER_INVITE}m\n\n` +
-        `You'll get a DM once you've been paid! 🎉`,
+        `✅ **Claim submitted!**\n\n` +
+        `🎮 **Minecraft IGN:** ${ign}\n` +
+        `🎟️ **Invites:** ${claimable}\n` +
+        `💰 **Reward:** ${claimable * REWARD_PER_INVITE}m\n\n` +
+        `You'll get a DM when your reward has been sent in-game! 🎉`,
     });
     return;
   }
 
-  // ── Mark individual as paid ───────────────────────────────────────────────
+  // ── Mark individual paid ───────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId.startsWith("mark_paid_")) {
     if (
       !interaction.member.permissions.has(PermissionFlagsBits.Administrator) &&
@@ -332,20 +495,33 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    const targetUserId = interaction.customId.replace("mark_paid_", "");
-
-    if (!pendingRewards[targetUserId]) {
-      await interaction.reply({ content: "❌ User not found in pending list.", ephemeral: true });
+    const targetId = interaction.customId.replace("mark_paid_", "");
+    if (!pendingRewards[targetId]) {
+      await interaction.reply({ content: "❌ Not found in pending list.", ephemeral: true });
       return;
     }
 
-    await payUser(interaction.client, interaction.guild, targetUserId);
+    const data   = pendingRewards[targetId];
+    const amount = data.invites * REWARD_PER_INVITE;
+
+    if (!mcBot || !mcReady) {
+      await interaction.reply({
+        content: `⚠️ Minecraft bot is not online! Payment queued for **${data.ign}** (${amount}m).\nUse \`!spawn\` to connect the bot and it will pay automatically.`,
+        ephemeral: true,
+      });
+      payQueue.push({ ign: data.ign, amount });
+    } else {
+      payQueue.push({ ign: data.ign, amount });
+      runPayQueue();
+      await interaction.reply({ content: `✅ Paying **${data.ign}** ${amount}m in-game now!`, ephemeral: true });
+    }
+
+    await payUser(interaction.client, interaction.guild, targetId);
     await updateRewardList(interaction.client, interaction.guild);
-    await interaction.reply({ content: `✅ Marked as paid and DM sent!`, ephemeral: true });
     return;
   }
 
-  // ── Pay all ───────────────────────────────────────────────────────────────
+  // ── Pay all ────────────────────────────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "pay_all") {
     if (
       !interaction.member.permissions.has(PermissionFlagsBits.Administrator) &&
@@ -355,111 +531,126 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    const unpaidUsers = Object.keys(pendingRewards);
-
-    if (unpaidUsers.length === 0) {
-      await interaction.reply({ content: "✅ No pending rewards to clear.", ephemeral: true });
+    const all = Object.keys(pendingRewards);
+    if (all.length === 0) {
+      await interaction.reply({ content: "✅ Nothing pending!", ephemeral: true });
       return;
     }
 
-    for (const userId of unpaidUsers) {
-      await payUser(interaction.client, interaction.guild, userId);
+    // Queue all payments
+    for (const uid of all) {
+      const data   = pendingRewards[uid];
+      const amount = data.invites * REWARD_PER_INVITE;
+      payQueue.push({ ign: data.ign, amount });
+    }
+
+    const botStatus = (!mcBot || !mcReady)
+      ? `\n\n⚠️ Minecraft bot is **offline** — payments have been queued. Use \`!spawn\` to connect it and they'll be sent automatically.`
+      : "";
+
+    // Pay everyone (DM + clear list)
+    for (const uid of all) {
+      await payUser(interaction.client, interaction.guild, uid);
     }
 
     await updateRewardList(interaction.client, interaction.guild);
+
+    if (mcBot && mcReady) runPayQueue();
+
     await interaction.reply({
-      content: `✅ All ${unpaidUsers.length} reward(s) paid and users DM'd!`,
+      content: `✅ Queued ${all.length} payment(s) — in-game commands are being sent now!${botStatus}`,
       ephemeral: true,
     });
     return;
   }
 });
 
-// ─── Pay a single user ────────────────────────────────────────────────────────
+// ─── Pay one user (DM + clear pending) ────────────────────────────────────────
 async function payUser(client, guild, userId) {
   const data = pendingRewards[userId];
   if (!data) return;
 
-  // Mark their invites as claimed so they don't double-dip
   claimedInvites[userId] = (claimedInvites[userId] || 0) + data.invites;
 
-  // DM the user
   try {
     const member = await guild.members.fetch(userId);
     await member.send(
-      `✅ **Your invite rewards have been paid!**\n\n` +
-      `**IGN:** ${data.ign}\n` +
-      `**Invites:** ${data.invites}\n` +
-      `**Amount:** ${data.invites * REWARD_PER_INVITE}m\n\n` +
+      `✅ **Your invite rewards are being paid in-game!**\n\n` +
+      `🎮 **IGN:** ${data.ign}\n` +
+      `🎟️ **Invites:** ${data.invites}\n` +
+      `💰 **Amount:** ${data.invites * REWARD_PER_INVITE}m\n\n` +
       `Please leave a vouch in **#Vouches-rewards**! 🎉`
     );
-  } catch (e) {
-    console.log(`⚠️ Could not DM user ${userId} — they may have DMs disabled.`);
+  } catch {
+    console.log(`⚠️ Could not DM ${userId}`);
   }
 
   delete pendingRewards[userId];
 }
 
-// ─── Build & update the reward list message ───────────────────────────────────
+// ─── Build / update the payout list ──────────────────────────────────────────
 async function updateRewardList(client, guild) {
   const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
-  if (!logChannel) return console.error("❌ Could not find reward log channel.");
+  if (!logChannel) return console.error("❌ Reward log channel not found.");
 
   const unpaid = Object.entries(pendingRewards);
 
+  const mcStatus = (!mcBot || !mcReady)
+    ? "🔴 MC Bot Offline — auto-reconnecting..."
+    : `🟢 MC Bot Online as \`${mcBot.username}\``;
+
   const embed = new EmbedBuilder()
-    .setTitle("📋 Pending Invite Rewards")
-    .setColor(0xffa500)
+    .setColor(0xf5a623)
+    .setTitle("🎁 Invite Reward Queue")
     .setTimestamp()
-    .setFooter({ text: "Click ✅ next to a player to mark them as paid" });
+    .setFooter({ text: mcStatus });
 
   if (unpaid.length === 0) {
-    embed.setDescription("✅ No pending rewards — all clear!");
+    embed.setDescription("✅ Queue is empty — all paid!");
   } else {
-    const lines = unpaid.map(
-      ([, data], i) =>
-        `**${i + 1}.** ${data.discordTag} | IGN: \`${data.ign}\` | ` +
-        `Invites: **${data.invites}** | Reward: **${data.invites * REWARD_PER_INVITE}m**`
-    );
+    const lines = unpaid.map(([, data], i) => {
+      const reward = data.invites * REWARD_PER_INVITE;
+      return `**${i + 1}.** ${data.discordTag} · IGN: \`${data.ign}\` · **${data.invites}** invite${data.invites === 1 ? "" : "s"} → **${reward}m**`;
+    });
+    const totalM = unpaid.reduce((s, [, d]) => s + d.invites * REWARD_PER_INVITE, 0);
     embed.setDescription(lines.join("\n"));
+    embed.addFields({ name: "Total to pay", value: `**${totalM}m**`, inline: false });
   }
 
   const components = [];
 
   if (unpaid.length > 0) {
-    // Individual pay buttons in rows of 4 (max 20 people shown)
     const chunks = chunkArray(unpaid.slice(0, 20), 4);
     for (const chunk of chunks) {
-      const row = new ActionRowBuilder().addComponents(
-        chunk.map(([userId, data]) =>
-          new ButtonBuilder()
-            .setCustomId(`mark_paid_${userId}`)
-            .setLabel(`✅ ${data.ign}`)
-            .setStyle(ButtonStyle.Success)
+      components.push(
+        new ActionRowBuilder().addComponents(
+          chunk.map(([uid, data]) =>
+            new ButtonBuilder()
+              .setCustomId(`mark_paid_${uid}`)
+              .setLabel(`✅ ${data.ign}`)
+              .setStyle(ButtonStyle.Success)
+          )
         )
       );
-      components.push(row);
     }
 
-    // Pay All button
     components.push(
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId("pay_all")
-          .setLabel("💰 Pay All & Clear List")
+          .setLabel("💰 Pay All & Clear Queue")
           .setStyle(ButtonStyle.Danger)
       )
     );
   }
 
-  // Edit existing message or post a new one
   if (rewardListMessageId) {
     try {
       const existing = await logChannel.messages.fetch(rewardListMessageId);
       await existing.edit({ embeds: [embed], components });
       return;
-    } catch (e) {
-      // Message was deleted — fall through to send a new one
+    } catch {
+      // message deleted, send new
     }
   }
 
@@ -468,9 +659,9 @@ async function updateRewardList(client, guild) {
 }
 
 function chunkArray(arr, size) {
-  const result = [];
-  for (let i = 0; i < arr.length; i += size) result.push(arr.slice(i, i + size));
-  return result;
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
 client.login(BOT_TOKEN);
