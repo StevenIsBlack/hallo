@@ -524,13 +524,23 @@ async function runPayQueue() {
   if (payRunning || payQueue.length === 0) return;
   payRunning = true;
 
-  while (payQueue.length > 0) {
+  // Merge duplicate IGNs into a single payment so shared accounts get paid correctly
+  // e.g. two people claim for "Steve" with 10m and 15m → one /pay Steve 25m
+  const merged = {};
+  for (const { ign, amount } of payQueue) {
+    const key = ign.toLowerCase();
+    merged[key] = { ign, amount: (merged[key]?.amount || 0) + amount };
+  }
+  payQueue = []; // clear original queue, we're using merged now
+
+  for (const { ign, amount } of Object.values(merged)) {
     if (!mcBot || !mcReady) {
-      console.log("⚠️ MC bot not ready — pausing pay queue");
-      break;
+      // Bot went offline mid-queue — re-add remaining to queue for later
+      payQueue.push({ ign, amount });
+      console.log(`⚠️ MC bot not ready — re-queued payment for ${ign}`);
+      continue;
     }
 
-    const { ign, amount } = payQueue.shift();
     const cmd = `/pay ${ign} ${amount}m`;
 
     try {
@@ -538,6 +548,7 @@ async function runPayQueue() {
       console.log(`💰 Sent: ${cmd}`);
     } catch (e) {
       console.error(`Failed to send pay command for ${ign}:`, e.message);
+      payQueue.push({ ign, amount }); // re-queue on failure
     }
 
     await new Promise((r) => setTimeout(r, 1500));
@@ -694,7 +705,9 @@ async function payUser(client, guild, userId) {
   const data = pendingRewards[userId];
   if (!data) return;
 
-  claimedInvites[userId] = (claimedInvites[userId] || 0) + data.invites;
+  // Reset both counters to 0 so future invites can be claimed fresh
+  userInvites[userId]    = 0;
+  claimedInvites[userId] = 0;
   delete pendingRewards[userId];
   saveData();
 
