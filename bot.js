@@ -26,6 +26,7 @@ const client = new Client({
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const REWARD_LOG_CHANNEL_ID = "1466514242558759278";
+const JOIN_LOG_CHANNEL_ID = "1442916311532441662";
 const REWARD_PER_INVITE = 5; // 1 invite = 5m
 const BOT_TOKEN = process.env.BOT_TOKEN;
 // ──────────────────────────────────────────────────────────────────────────────
@@ -97,13 +98,45 @@ client.on("guildMemberAdd", async (member) => {
     });
     inviteCache.set(member.guild.id, updatedCache);
 
+    const joinChannel = await member.guild.channels.fetch(JOIN_LOG_CHANNEL_ID).catch(() => null);
+
     if (usedInvite && usedInvite.inviter) {
       const inviterId = usedInvite.inviter.id;
       userInvites[inviterId] = (userInvites[inviterId] || 0) + 1;
+      const totalInvites = userInvites[inviterId];
+
       console.log(
         `📥 ${member.user.tag} joined via ${usedInvite.inviter.tag}'s invite. ` +
-        `They now have ${userInvites[inviterId]} total invite(s).`
+        `They now have ${totalInvites} total invite(s).`
       );
+
+      if (joinChannel) {
+        const embed = new EmbedBuilder()
+          .setColor(0x57f287)
+          .setTitle("👋 New Member Joined!")
+          .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `<@${member.id}> has been invited by <@${inviterId}>\n` +
+            `<@${inviterId}> now has **${totalInvites}** invite${totalInvites === 1 ? "" : "s"}.`
+          )
+          .setFooter({ text: `Member #${member.guild.memberCount}` })
+          .setTimestamp();
+
+        await joinChannel.send({ embeds: [embed] });
+      }
+    } else {
+      // Couldn't detect inviter (vanity URL, widget, etc.)
+      if (joinChannel) {
+        const embed = new EmbedBuilder()
+          .setColor(0xfee75c)
+          .setTitle("👋 New Member Joined!")
+          .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+          .setDescription(`<@${member.id}> joined but the inviter couldn't be detected.`)
+          .setFooter({ text: `Member #${member.guild.memberCount}` })
+          .setTimestamp();
+
+        await joinChannel.send({ embeds: [embed] });
+      }
     }
   } catch (e) {
     console.error("Error tracking invite on member join:", e.message);
