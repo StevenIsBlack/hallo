@@ -313,7 +313,7 @@ async function spawnMinecraftBot(feedbackChannel) {
       port:     MC_PORT,
       username: MC_USERNAME,
       auth:     "microsoft",
-      version:  false, // auto-detect server version
+      version:  "1.20.5",
     });
 
     // Microsoft device code auth — send link to Discord or just log it
