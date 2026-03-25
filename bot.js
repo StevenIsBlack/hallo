@@ -32,9 +32,9 @@ const JOIN_LOG_CHANNEL_ID   = "1442916311532441662";
 const REWARD_PER_INVITE     = 5; // 1 invite = 5m
 const BOT_TOKEN             = process.env.BOT_TOKEN;
 
-// Minecraft bot credentials — set these as Railway environment variables
-const MC_EMAIL    = process.env.MC_EMAIL;    // your Minecraft account email
-const MC_PASSWORD = process.env.MC_PASSWORD; // your Minecraft account password
+// Minecraft bot credentials — set MC_USERNAME in Railway environment variables
+// MC_USERNAME = your Minecraft Java username (NOT email, just the in-game name e.g. "Steve")
+const MC_USERNAME = process.env.MC_USERNAME;
 const MC_HOST     = "donutsmp.net";
 const MC_PORT     = 25565;
 // ──────────────────────────────────────────────────────────────────────────────
@@ -71,11 +71,11 @@ client.once("ready", async () => {
   console.log(`✅ ${client.user.tag} is online`);
 
   // Auto-connect Minecraft bot on startup
-  if (MC_EMAIL && MC_PASSWORD) {
+  if (MC_USERNAME) {
     console.log("🎮 Auto-connecting Minecraft bot...");
     spawnMinecraftBot(null);
   } else {
-    console.warn("⚠️ MC_EMAIL or MC_PASSWORD not set — Minecraft bot won't connect.");
+    console.warn("⚠️ MC_USERNAME not set — Minecraft bot won't connect.");
   }
 
   for (const guild of client.guilds.cache.values()) {
@@ -311,8 +311,7 @@ async function spawnMinecraftBot(feedbackChannel) {
     mcBot = mineflayer.createBot({
       host:     MC_HOST,
       port:     MC_PORT,
-      username: MC_EMAIL,
-      password: MC_PASSWORD,
+      username: MC_USERNAME,
       auth:     "microsoft",
       version:  false, // auto-detect server version
     });
@@ -323,7 +322,7 @@ async function spawnMinecraftBot(feedbackChannel) {
         `🔐 **Microsoft Verification Required**\n\n` +
         `1. Go to: **${data.verificationUri}**\n` +
         `2. Enter code: \`${data.userCode}\`\n` +
-        `3. Sign in with your Microsoft account\n\n` +
+        `3. Sign in with the Microsoft account linked to your Minecraft Java account\n\n` +
         `The bot will join automatically once verified!`;
 
       console.log(`🔐 Microsoft verification needed — code: ${data.userCode} at ${data.verificationUri}`);
