@@ -16,6 +16,14 @@ const mineflayer = require("mineflayer");
 const fs         = require("fs");
 const path       = require("path");
 
+// Prevent unhandled promise rejections (e.g. Discord interaction timeouts) from crashing the bot
+process.on("unhandledRejection", (err) => {
+  // Ignore Discord's "Unknown interaction" errors — these happen when buttons are
+  // clicked on old messages after a restart and are completely harmless
+  if (err?.code === 10062) return;
+  console.error("Unhandled rejection:", err?.message || err);
+});
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -639,9 +647,12 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // Defer immediately so Discord doesn't time out while we do async work
+    await interaction.deferReply({ ephemeral: true });
+
     const targetId = interaction.customId.replace("mark_paid_", "");
     if (!pendingRewards[targetId]) {
-      await interaction.reply({ content: "❌ Not found in pending list.", ephemeral: true });
+      await interaction.editReply({ content: "❌ Not found in pending list." });
       return;
     }
 
@@ -649,16 +660,17 @@ client.on("interactionCreate", async (interaction) => {
     const amount = data.invites * REWARD_PER_INVITE;
 
     payQueue.push({ ign: data.ign, amount });
-    if (mcBot && mcReady) runPayQueue();
 
     await payUser(interaction.client, interaction.guild, targetId);
     await updateRewardList(interaction.client, interaction.guild);
+
+    if (mcBot && mcReady) runPayQueue();
 
     const status = (!mcBot || !mcReady)
       ? `⚠️ MC bot offline — payment queued for when it reconnects.`
       : `✅ Paying **${data.ign}** ${amount}m in-game now!`;
 
-    await interaction.reply({ content: status, ephemeral: true });
+    await interaction.editReply({ content: status });
     return;
   }
 
@@ -672,30 +684,42 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // Defer immediately so Discord doesn't time out while we process everyone
+    await interaction.deferReply({ ephemeral: true });
+
     const all = Object.keys(pendingRewards);
     if (all.length === 0) {
-      await interaction.reply({ content: "✅ Nothing pending!", ephemeral: true });
+      await interaction.editReply({ content: "✅ Nothing pending!" });
       return;
     }
 
-    for (const uid of all) {
-      const data   = pendingRewards[uid];
-      const amount = data.invites * REWARD_PER_INVITE;
-      payQueue.push({ ign: data.ign, amount });
+    // Snapshot names before we clear pendingRewards
+    const snapshot = all.map(uid => ({
+      uid,
+      ign:    pendingRewards[uid].ign,
+      amount: pendingRewards[uid].invites * REWARD_PER_INVITE,
+    }));
+
+    // Queue all payments first
+    for (const { ign, amount } of snapshot) {
+      payQueue.push({ ign, amount });
     }
 
+    // Clear pending list and DM everyone
     for (const uid of all) {
       await payUser(interaction.client, interaction.guild, uid);
     }
 
     await updateRewardList(interaction.client, interaction.guild);
+
+    // Fire the queue after everything is cleared
     if (mcBot && mcReady) runPayQueue();
 
     const status = (!mcBot || !mcReady)
-      ? `✅ ${all.length} payment(s) queued — will be sent when MC bot reconnects.`
-      : `✅ Paying ${all.length} player(s) in-game now!`;
+      ? `✅ ${snapshot.length} payment(s) queued — will be sent when MC bot reconnects.`
+      : `✅ Paying ${snapshot.length} player(s) in-game now!`;
 
-    await interaction.reply({ content: status, ephemeral: true });
+    await interaction.editReply({ content: status });
     return;
   }
 });
