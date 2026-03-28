@@ -543,6 +543,33 @@ client.on("messageCreate", async (message) => {
     }
     return;
   }
+
+  // ── !cd <command> — send a command to Minecraft as the bot ─────────────────
+  if (command === "!cd") {
+    if (!isAdmin) return;
+
+    const mcCommand = args.slice(1).join(" ");
+
+    if (!mcCommand) {
+      await message.reply("❌ Usage: `!cd <command>`\nExample: `!cd tpa Steve` or `!cd say Hello!`");
+      return;
+    }
+
+    if (!mcBot || !mcReady) {
+      await message.reply("❌ Minecraft bot is not connected. Use `!mcreconnect` first.");
+      return;
+    }
+
+    try {
+      // Prefix with / if not already there
+      const toSend = mcCommand.startsWith("/") ? mcCommand : `/${mcCommand}`;
+      mcBot.chat(toSend);
+      await message.reply(`✅ Sent to Minecraft: \`${toSend}\``);
+    } catch (e) {
+      await message.reply(`❌ Failed to send command: \`${e.message}\``);
+    }
+    return;
+  }
 });
 
 // ─── Spawn the Mineflayer bot ─────────────────────────────────────────────────
