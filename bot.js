@@ -678,14 +678,31 @@ async function spawnMinecraftBot(feedbackChannel) {
       setTimeout(() => spawnMinecraftBot(null), 60000);
     });
 
-    mcBot.on("error", (err) => { mcReady = false; console.error("Minecraft bot error:", err.message); });
+    mcBot.on("error", async (err) => {
+      mcReady = false;
+      console.error("Minecraft bot error:", err.message);
+      // Post error to Discord so you can see what's happening
+      const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+      if (ch) await ch.send(`❌ Minecraft bot error: \`${err.message}\` — reconnecting in 30s...`).catch(() => {});
+      mcBot = null;
+      setTimeout(() => spawnMinecraftBot(null), 30000);
+    });
 
-    mcBot.on("end", () => {
-      if (mcReady) {
-        mcReady = false;
+    mcBot.on("end", async () => {
+      const wasReady = mcReady;
+      mcReady = false;
+      mcBot = null;
+      if (wasReady) {
         console.log("Minecraft bot disconnected — reconnecting in 30s...");
-        setTimeout(() => spawnMinecraftBot(null), 30000);
+        const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (ch) await ch.send(`⚠️ Minecraft bot disconnected unexpectedly — reconnecting in 30s...`).catch(() => {});
+      } else {
+        // Disconnected before even spawning — likely auth issue or connection refused
+        console.log("Minecraft bot ended before spawning — reconnecting in 30s...");
+        const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (ch) await ch.send(`⚠️ Minecraft bot failed to connect — reconnecting in 30s...`).catch(() => {});
       }
+      setTimeout(() => spawnMinecraftBot(null), 30000);
     });
 
   } catch (e) {
