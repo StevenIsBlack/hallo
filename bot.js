@@ -39,7 +39,7 @@ const REWARD_LOG_CHANNEL_ID = "1466514242558759278";
 const JOIN_LOG_CHANNEL_ID   = "1442916311532441662";
 const FRAUD_CHANNEL_ID      = "1442923076147744838";
 const REWARD_PER_INVITE     = 5;    // 1 invite = 5m
-const MIN_ACCOUNT_AGE_DAYS  = 90;   // account must be this old to count
+const MIN_ACCOUNT_AGE_DAYS  = 180;   // account must be this old to count
 const BURST_LIMIT           = 5;    // X invites in 60s = invites get reset
 const DAILY_LIMIT           = 20;   // 20+ invites in 24h = flagged
 const BOT_TOKEN             = process.env.BOT_TOKEN;
@@ -765,10 +765,30 @@ async function spawnMinecraftBot(feedbackChannel) {
 
   try {
     mcBot = mineflayer.createBot({
-      host: MC_HOST, port: MC_PORT, username: MC_USERNAME,
-      auth: "microsoft", version: "1.20.5",
+      host:           MC_HOST,
+      port:           MC_PORT,
+      username:       MC_USERNAME,
+      auth:           "microsoft",
+      version:        "1.21.4", // updated version
       profilesFolder: authCacheDir,
+      keepAlive:      true,
     });
+
+    // Timeout: if bot hasn't spawned within 2 minutes, force reconnect
+    const spawnTimeout = setTimeout(async () => {
+      if (!mcReady && mcBot) {
+        console.log("⚠️ Bot took too long to spawn — forcing reconnect");
+        try { mcBot.quit(); } catch {}
+        mcBot        = null;
+        mcConnecting = false;
+        const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (ch) await ch.send("⚠️ Minecraft bot took too long to connect — retrying in 30s...").catch(() => {});
+        setTimeout(() => spawnMinecraftBot(null), 30000);
+      }
+    }, 120000);
+
+    // Clear timeout once spawned
+    mcBot.once("spawn", () => clearTimeout(spawnTimeout));
 
     mcBot.on("microsoftDeviceCode", async (data) => {
       const msg =
@@ -856,15 +876,15 @@ async function spawnMinecraftBot(feedbackChannel) {
       mcConnecting = false;
       mcBot        = null;
       if (wasReady) {
-        console.log("Minecraft bot disconnected — reconnecting in 30s...");
+        console.log("Minecraft bot disconnected — reconnecting in 90s...");
         const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
-        if (ch) await ch.send(`⚠️ Minecraft bot disconnected — reconnecting in 30s...`).catch(() => {});
+        if (ch) await ch.send(`⚠️ Minecraft bot disconnected — reconnecting in 90s...`).catch(() => {});
       } else {
-        console.log("Minecraft bot ended before spawning — reconnecting in 30s...");
+        console.log("Minecraft bot ended before spawning — reconnecting in 90s...");
         const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
-        if (ch) await ch.send(`⚠️ Minecraft bot failed to connect — reconnecting in 30s...`).catch(() => {});
+        if (ch) await ch.send(`⚠️ Minecraft bot failed to connect — reconnecting in 90s...`).catch(() => {});
       }
-      setTimeout(() => spawnMinecraftBot(null), 30000);
+      setTimeout(() => spawnMinecraftBot(null), 90000);
     });
 
   } catch (e) {
@@ -1010,6 +1030,26 @@ client.on("interactionCreate", async (interaction) => {
           .setTimestamp()] }).catch(() => {});
       }
       return;
+    }
+
+    // ── Minimum server membership check (24 hours) ───────────────────────────
+    const member = await interaction.guild.members.fetch(userId).catch(() => null);
+    if (member) {
+      const joinedAt   = member.joinedTimestamp;
+      const hoursInServer = (Date.now() - joinedAt) / (1000 * 60 * 60);
+      if (hoursInServer < 24) {
+        const hoursLeft = Math.ceil(24 - hoursInServer);
+        await interaction.editReply({
+          content:
+            `⏳ **You need to be in the server for at least 24 hours before claiming rewards.**
+
+` +
+            `You joined **${Math.floor(hoursInServer)} hour${Math.floor(hoursInServer) === 1 ? "" : "s"}** ago.
+` +
+            `Come back in **${hoursLeft} hour${hoursLeft === 1 ? "" : "s"}**!`,
+        });
+        return;
+      }
     }
 
     if (pendingRewards[userId]) {
