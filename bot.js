@@ -15,11 +15,6 @@ const {
 const mineflayer = require("mineflayer");
 const fs         = require("fs");
 const path       = require("path");
-const dns        = require("dns");
-
-// Force Google DNS so Railway can resolve game server hostnames
-dns.setDefaultResultOrder("ipv4first");
-dns.setServers(["8.8.8.8", "8.8.4.4", "1.1.1.1"]);
 
 // Prevent crashes from interaction timeouts and other unhandled rejections
 process.on("unhandledRejection", (err) => {
