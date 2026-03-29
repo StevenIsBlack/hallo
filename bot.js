@@ -15,6 +15,11 @@ const {
 const mineflayer = require("mineflayer");
 const fs         = require("fs");
 const path       = require("path");
+const dns        = require("dns");
+
+// Force Google DNS so Railway can resolve game server hostnames
+dns.setDefaultResultOrder("ipv4first");
+dns.setServers(["8.8.8.8", "8.8.4.4", "1.1.1.1"]);
 
 // Prevent crashes from interaction timeouts and other unhandled rejections
 process.on("unhandledRejection", (err) => {
@@ -44,7 +49,7 @@ const BURST_LIMIT           = 5;    // X invites in 60s = invites get reset
 const DAILY_LIMIT           = 20;   // 20+ invites in 24h = flagged
 const BOT_TOKEN             = process.env.BOT_TOKEN;
 const MC_USERNAME           = process.env.MC_USERNAME;
-const MC_HOST               = "51.195.18.123";
+const MC_HOST               = "donutsmp.net";
 const MC_PORT               = 25565;
 // ──────────────────────────────────────────────────────────────────────────────
 
