@@ -15,6 +15,17 @@ const {
 const mineflayer = require("mineflayer");
 const fs         = require("fs");
 const path       = require("path");
+const dns        = require("dns");
+
+// Force Google DNS so Railway can resolve game server hostnames
+dns.setDefaultResultOrder("ipv4first");
+dns.setServers(["8.8.8.8", "8.8.4.4", "1.1.1.1"]);
+
+// Test DNS resolution on startup
+dns.lookup("donutsmp.net", (err, addr) => {
+  if (err) console.error("❌ DNS lookup failed for donutsmp.net:", err.message);
+  else console.log(`✅ DNS resolved donutsmp.net → ${addr}`);
+});
 
 // Prevent crashes from interaction timeouts and other unhandled rejections
 process.on("unhandledRejection", (err) => {
@@ -757,6 +768,7 @@ async function spawnMinecraftBot(feedbackChannel) {
   mcConnecting = true;
   if (mcBot) { try { mcBot.quit(); } catch {} mcBot = null; mcReady = false; }
 
+  console.log(`🔄 Attempting to connect to ${MC_HOST}:${MC_PORT} as ${MC_USERNAME}...`);
   if (feedbackChannel) await feedbackChannel.send("🔄 Connecting Minecraft bot...");
 
   const authCacheDir = path.join(DATA_DIR, "auth_cache");
@@ -769,10 +781,12 @@ async function spawnMinecraftBot(feedbackChannel) {
       port:           MC_PORT,
       username:       MC_USERNAME,
       auth:           "microsoft",
-      version:        "1.21", // updated version
+      version:        "1.21.5", // updated version
       profilesFolder: authCacheDir,
       keepAlive:      true,
     });
+
+    console.log("✅ mineflayer.createBot() called — waiting for connection...");
 
     // Timeout: if bot hasn't spawned within 2 minutes, force reconnect
     const spawnTimeout = setTimeout(async () => {
