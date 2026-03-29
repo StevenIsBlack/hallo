@@ -781,7 +781,7 @@ async function spawnMinecraftBot(feedbackChannel) {
       port:           MC_PORT,
       username:       MC_USERNAME,
       auth:           "microsoft",
-      version:        "1.21.5", // updated version
+      version:        "1.20.5", // updated version
       profilesFolder: authCacheDir,
       keepAlive:      true,
     });
