@@ -105,10 +105,11 @@ let rewardListMessageId = saved.rewardListMessageId || null;
 // ─── MINECRAFT BOT STATE ──────────────────────────────────────────────────────
 const inviteCache      = new Map();
 const inviteTimestamps = {}; // { userId: [timestamp, ...] } for velocity checks
-let mcBot      = null;
-let mcReady    = false;
-let payQueue   = [];
-let payRunning = false;
+let mcBot             = null;
+let mcReady           = false;
+let payQueue          = [];
+let payRunning        = false;
+let balPendingChannel = null; // Discord channel waiting for !bal response
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ─── READY ────────────────────────────────────────────────────────────────────
@@ -515,6 +516,25 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // ── !bal — check the MC bot's in-game balance ────────────────────────────
+  if (command === "!bal") {
+    if (!isAdmin) return;
+    if (!mcBot || !mcReady) {
+      await message.reply("❌ Minecraft bot is not connected.");
+      return;
+    }
+    balPendingChannel = message.channel;
+    mcBot.chat("/bal");
+    await message.reply("⏳ Checking balance... response will appear here shortly.");
+    // Auto-clear after 10s if no response came
+    setTimeout(() => {
+      if (balPendingChannel === message.channel) {
+        balPendingChannel = null;
+      }
+    }, 10000);
+    return;
+  }
+
   // ── !mcreconnect ───────────────────────────────────────────────────────────
   if (command === "!mcreconnect") {
     if (!isAdmin) return;
@@ -618,6 +638,34 @@ async function spawnMinecraftBot(feedbackChannel) {
       if (payQueue.length > 0) { console.log(`⏳ Processing ${payQueue.length} queued payment(s)...`); runPayQueue(); }
     });
 
+    // Listen to all chat messages from the Minecraft server
+    mcBot.on("message", async (jsonMsg) => {
+      const text = jsonMsg.toString().trim();
+      if (!text) return;
+      console.log(`[MC Chat] ${text}`);
+
+      // Forward balance response to Discord when !bal was used
+      if (balPendingChannel) {
+        // Most economy plugins respond with something containing the balance
+        // Common formats: "Your balance: 1,234m", "Balance: $1234", etc.
+        // Format: "You have $1B"
+        const isBalResponse = /you have \$[\d\.]+[kmbt]?/i.test(text);
+        if (isBalResponse) {
+          await balPendingChannel.send(`💰 **MC Bot Balance:**
+\`\`\`${text}\`\`\``).catch(() => {});
+          balPendingChannel = null;
+        }
+      }
+
+      // Log payment confirmations — forward to reward log channel
+      // Format: "You paid StevenIsBlack $5M." or "StevenIsBlack paid you $5M."
+      const isPayConfirm = /you paid .+ \$[\d\.]+[kmbt]?/i.test(text) || /paid you \$[\d\.]+[kmbt]?/i.test(text);
+      if (isPayConfirm) {
+        const logCh = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+        if (logCh) await logCh.send(`✅ **MC Confirmation:** \`${text}\``).catch(() => {});
+      }
+    });
+
     mcBot.on("kicked", async (reason) => {
       mcReady = false;
       let r = reason;
@@ -648,35 +696,63 @@ async function spawnMinecraftBot(feedbackChannel) {
 
 // ─── Run pay queue ─────────────────────────────────────────────────────────────
 async function runPayQueue() {
-  if (payRunning || payQueue.length === 0) return;
+  // Prevent multiple simultaneous runs
+  if (payRunning) return;
+  if (payQueue.length === 0) return;
+
   payRunning = true;
 
-  // Merge duplicate IGNs into a single payment
+  // Snapshot and clear the queue atomically so nothing gets added mid-run
+  const toProcess = [...payQueue];
+  payQueue = [];
+
+  // Merge duplicate IGNs so shared accounts get one combined payment
   const merged = {};
-  for (const { ign, amount } of payQueue) {
+  for (const { ign, amount } of toProcess) {
     const key = ign.toLowerCase();
     merged[key] = { ign, amount: (merged[key]?.amount || 0) + amount };
   }
-  payQueue = [];
 
-  for (const { ign, amount } of Object.values(merged)) {
+  const entries = Object.values(merged);
+  console.log(`💰 Starting pay queue: ${entries.length} payment(s) to send`);
+
+  const logChannel = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
+
+  for (let i = 0; i < entries.length; i++) {
+    const { ign, amount } = entries[i];
+
     if (!mcBot || !mcReady) {
-      payQueue.push({ ign, amount });
-      console.log(`⚠️ MC bot not ready — re-queued payment for ${ign}`);
-      continue;
+      // Bot went offline mid-queue — re-add ALL remaining entries and stop
+      const remaining = entries.slice(i);
+      for (const entry of remaining) payQueue.push(entry);
+      console.log(`⚠️ MC bot went offline — re-queued ${remaining.length} payment(s)`);
+      if (logChannel) await logChannel.send(`⚠️ MC bot went offline mid-payment — **${remaining.length}** payment(s) re-queued. They will be sent when the bot reconnects.`).catch(() => {});
+      break;
     }
+
     const cmd = `/pay ${ign} ${amount}m`;
     try {
       mcBot.chat(cmd);
-      console.log(`💰 Sent: ${cmd}`);
+      console.log(`💰 [${i + 1}/${entries.length}] Sent: ${cmd}`);
     } catch (e) {
-      console.error(`Failed to send pay command for ${ign}:`, e.message);
+      // Command failed — re-queue this specific payment
       payQueue.push({ ign, amount });
+      console.error(`❌ Failed to send ${cmd} — re-queued:`, e.message);
+      if (logChannel) await logChannel.send(`❌ Failed to send \`${cmd}\` — re-queued.`).catch(() => {});
     }
-    await new Promise((r) => setTimeout(r, 1500));
+
+    // 2 second gap between commands — more reliable than 1.5s
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
+  console.log(`✅ Pay queue finished`);
   payRunning = false;
+
+  // If new entries were added while we were running, process them now
+  if (payQueue.length > 0) {
+    console.log(`⏳ ${payQueue.length} new payment(s) queued during run — processing now`);
+    runPayQueue();
+  }
 }
 
 // ─── INTERACTIONS ─────────────────────────────────────────────────────────────
