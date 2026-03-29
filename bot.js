@@ -77,6 +77,7 @@ function saveData() {
       claimedInvites,
       pendingRewards,
       allTimeInvites,
+      bannedUsernames,
       invitedBy,
       joinedBefore: [...joinedBefore],
       rewardListMessageId,
@@ -93,7 +94,9 @@ const claimedInvites = saved.claimedInvites || {};
 // Pending payout list
 let pendingRewards   = saved.pendingRewards || {};
 // All-time invite leaderboard (NEVER resets)
-const allTimeInvites = saved.allTimeInvites || {};
+const allTimeInvites  = saved.allTimeInvites  || {};
+// Ban list: { username: { reason, addedBy, addedAt } }
+const bannedUsernames = saved.bannedUsernames || {};
 // Rejoin detection
 const joinedBefore   = new Set(saved.joinedBefore || []);
 // Who invited who: { memberId: inviterId }
@@ -169,6 +172,46 @@ client.on("guildMemberAdd", async (member) => {
 
     const joinChannel  = await member.guild.channels.fetch(JOIN_LOG_CHANNEL_ID).catch(() => null);
     const fraudChannel = await member.guild.channels.fetch(FRAUD_CHANNEL_ID).catch(() => null);
+
+    // ── Username ban check ─────────────────────────────────────────────────
+    const usernameLower = member.user.username.toLowerCase();
+    const banEntry = bannedUsernames[usernameLower];
+    if (banEntry) {
+      console.log(`🔨 Banned username detected: ${member.user.username} — auto-banning`);
+      try {
+        await member.send(
+          `🔨 **You have been banned from Donut Market.**
+
+` +
+          `**Reason:** ${banEntry.reason}
+
+` +
+          `If you believe this is a mistake, contact the server staff.`
+        ).catch(() => {});
+        await member.ban({ reason: `Auto-ban: banned username. Reason: ${banEntry.reason}` });
+        if (fraudChannel) {
+          await fraudChannel.send({ embeds: [new EmbedBuilder()
+            .setColor(0xff0000)
+            .setTitle("🔨 Banned Username Auto-Banned")
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+            .setDescription(
+              `**User:** ${member.user.username} (<@${member.id}>)
+` +
+              `**Reason:** ${banEntry.reason}
+` +
+              `**Added by:** ${banEntry.addedBy}
+` +
+              `**Added at:** <t:${Math.floor(banEntry.addedAt / 1000)}:R>`
+            )
+            .setTimestamp()] });
+        }
+      } catch (e) {
+        console.error("Failed to auto-ban:", e.message);
+        if (fraudChannel) await fraudChannel.send(`❌ Failed to auto-ban **${member.user.username}**: \`${e.message}\``).catch(() => {});
+      }
+      return;
+    }
+
     const isRejoin     = joinedBefore.has(member.id);
     joinedBefore.add(member.id);
 
@@ -516,6 +559,91 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // ── !banlist — open the ban management GUI ───────────────────────────────
+  if (command === "!banlist") {
+    if (!isAdmin) {
+      const r = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => r.delete().catch(() => {}), 5000);
+      return;
+    }
+
+    const entries = Object.entries(bannedUsernames);
+    const embed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setTitle("🔨 Username Ban List")
+      .setDescription(entries.length === 0
+        ? "No usernames banned yet. Use `!addban` to add one."
+        : entries.map(([name, data], i) => `**${i + 1}.** \`${name}\` — ${data.reason} *(by ${data.addedBy})*`).join("\n")
+      )
+      .setFooter({ text: `${entries.length} banned username(s)` })
+      .setTimestamp();
+
+    const components = [];
+    if (entries.length > 0) {
+      const chunks = chunkArray(entries.slice(0, 20), 4);
+      for (const chunk of chunks) {
+        components.push(new ActionRowBuilder().addComponents(
+          chunk.map(([name]) =>
+            new ButtonBuilder()
+              .setCustomId(`unban_username_${name}`)
+              .setLabel(`🗑️ ${name}`)
+              .setStyle(ButtonStyle.Danger)
+          )
+        ));
+      }
+    }
+
+    // Add ban button
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("add_username_ban")
+        .setLabel("➕ Add Username Ban")
+        .setStyle(ButtonStyle.Primary)
+    ));
+
+    await message.reply({ embeds: [embed], components });
+    return;
+  }
+
+  // ── !addban <username> <reason> ────────────────────────────────────────────
+  if (command === "!addban") {
+    if (!isAdmin) {
+      const r = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => r.delete().catch(() => {}), 5000);
+      return;
+    }
+    const username = args[1]?.toLowerCase();
+    const reason   = args.slice(2).join(" ") || "Ban evasion";
+    if (!username) {
+      const r = await message.reply("❌ Usage: `!addban <username> <reason>`");
+      setTimeout(() => r.delete().catch(() => {}), 5000);
+      return;
+    }
+    bannedUsernames[username] = { reason, addedBy: message.author.tag, addedAt: Date.now() };
+    saveData();
+    await message.reply(`✅ Added \`${username}\` to the ban list. Reason: **${reason}**`);
+    return;
+  }
+
+  // ── !removeban <username> ──────────────────────────────────────────────────
+  if (command === "!removeban") {
+    if (!isAdmin) {
+      const r = await message.reply("❌ Only admins can use this command.");
+      setTimeout(() => r.delete().catch(() => {}), 5000);
+      return;
+    }
+    const username = args[1]?.toLowerCase();
+    if (!username || !bannedUsernames[username]) {
+      const r = await message.reply(`❌ Username \`${username}\` not found in ban list.`);
+      setTimeout(() => r.delete().catch(() => {}), 5000);
+      return;
+    }
+    delete bannedUsernames[username];
+    saveData();
+    await message.reply(`✅ Removed \`${username}\` from the ban list.`);
+    return;
+  }
+
   // ── !bal — check the MC bot's in-game balance ────────────────────────────
   if (command === "!bal") {
     if (!isAdmin) return;
@@ -811,6 +939,61 @@ client.on("interactionCreate", async (interaction) => {
     saveData();
     await updateRewardList(interaction.client, interaction.guild);
     await interaction.editReply({ content: `✅ **Claim submitted!**\n\n🎮 **IGN:** ${ign}\n🎟️ **Invites:** ${claimable}\n💰 **Reward:** ${claimable * REWARD_PER_INVITE}m\n\nYou'll get a DM when paid in-game! 🎉` });
+    return;
+  }
+
+  // ── Add username ban modal ────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId === "add_username_ban") {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator) && interaction.guild.ownerId !== interaction.user.id) {
+      await interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+      return;
+    }
+    const modal = new ModalBuilder().setCustomId("add_ban_modal").setTitle("Add Username Ban");
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("ban_username").setLabel("Discord Username (exact)")
+          .setStyle(TextInputStyle.Short).setPlaceholder("e.g. steve123").setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("ban_reason").setLabel("Reason")
+          .setStyle(TextInputStyle.Short).setPlaceholder("e.g. Ban evasion - original account: steve").setRequired(true)
+      )
+    );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // ── Add ban modal submit ───────────────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId === "add_ban_modal") {
+    await interaction.deferReply({ ephemeral: true });
+    const username = interaction.fields.getTextInputValue("ban_username").trim().toLowerCase();
+    const reason   = interaction.fields.getTextInputValue("ban_reason").trim();
+
+    bannedUsernames[username] = { reason, addedBy: interaction.user.tag, addedAt: Date.now() };
+    saveData();
+
+    await interaction.editReply({ content: `✅ Added \`${username}\` to the ban list.
+**Reason:** ${reason}
+
+If they try to join the server they will be instantly banned and DM'd the reason.` });
+    return;
+  }
+
+  // ── Unban username button ──────────────────────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith("unban_username_")) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator) && interaction.guild.ownerId !== interaction.user.id) {
+      await interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const username = interaction.customId.replace("unban_username_", "");
+    if (!bannedUsernames[username]) {
+      await interaction.editReply({ content: `❌ \`${username}\` not found in ban list.` });
+      return;
+    }
+    delete bannedUsernames[username];
+    saveData();
+    await interaction.editReply({ content: `✅ Removed \`${username}\` from the ban list.` });
     return;
   }
 
