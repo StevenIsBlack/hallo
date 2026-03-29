@@ -663,6 +663,32 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // ── !clearauth — delete cached Microsoft token and force re-login ──────────
+  if (command === "!clearauth") {
+    if (!isAdmin) return;
+
+    const authCacheDir = path.join(DATA_DIR, "auth_cache");
+    try {
+      if (fs.existsSync(authCacheDir)) {
+        const files = fs.readdirSync(authCacheDir);
+        for (const file of files) {
+          fs.unlinkSync(path.join(authCacheDir, file));
+        }
+        await message.reply("✅ Auth cache cleared! Reconnecting now — check this channel for the verification code.");
+      } else {
+        await message.reply("ℹ️ No auth cache found. Reconnecting anyway...");
+      }
+    } catch (e) {
+      await message.reply(`❌ Failed to clear auth cache: \`${e.message}\``);
+      return;
+    }
+
+    // Disconnect existing bot and reconnect with fresh auth
+    if (mcBot) { mcBot.quit(); mcBot = null; mcReady = false; }
+    await spawnMinecraftBot(message.channel);
+    return;
+  }
+
   // ── !mcreconnect ───────────────────────────────────────────────────────────
   if (command === "!mcreconnect") {
     if (!isAdmin) return;
