@@ -615,7 +615,7 @@ client.on("messageCreate", async (message) => {
     const username = args[1]?.toLowerCase();
     const reason   = args.slice(2).join(" ") || "Ban evasion";
     if (!username) {
-      const r = await message.reply("❌ Usage: `!addban <username> <reason>`");
+      const r = await message.reply("❌ Usage: `!addban <minecraft_ign> <reason>`");
       setTimeout(() => r.delete().catch(() => {}), 5000);
       return;
     }
@@ -925,6 +925,58 @@ client.on("interactionCreate", async (interaction) => {
     const claimed    = claimedInvites[userId] || 0;
     const claimable  = total - claimed;
 
+    // ── Banned IGN check ───────────────────────────────────────────────────
+    const ignLower  = ign.toLowerCase();
+    const ignBanEntry = bannedUsernames[ignLower];
+    if (ignBanEntry) {
+      console.log(`🔨 Banned IGN used by ${discordTag} (${userId}): ${ign}`);
+
+      // Tell them before banning so the DM goes through
+      await interaction.editReply({ content: `🔨 **You have been banned.**
+
+**Reason:** ${ignBanEntry.reason}` });
+
+      // DM them
+      try {
+        await interaction.user.send(
+          `🔨 **You have been banned from Donut Market.**
+
+` +
+          `**Reason:** ${ignBanEntry.reason}
+
+` +
+          `If you believe this is a mistake, contact the server staff.`
+        );
+      } catch { /* DMs off, ignore */ }
+
+      // Ban them
+      try {
+        const member = await interaction.guild.members.fetch(userId);
+        await member.ban({ reason: `Banned IGN used: ${ign}. Reason: ${ignBanEntry.reason}` });
+      } catch (e) {
+        console.error("Failed to ban member:", e.message);
+      }
+
+      // Alert in fraud channel
+      const fraudCh = await interaction.client.channels.fetch(FRAUD_CHANNEL_ID).catch(() => null);
+      if (fraudCh) {
+        await fraudCh.send({ embeds: [new EmbedBuilder()
+          .setColor(0xff0000)
+          .setTitle("🔨 Banned IGN — User Banned")
+          .setDescription(
+            `**Discord:** ${discordTag} (<@${userId}>)
+` +
+            `**Minecraft IGN entered:** \`${ign}\`
+` +
+            `**Reason:** ${ignBanEntry.reason}
+` +
+            `**Ban added by:** ${ignBanEntry.addedBy}`
+          )
+          .setTimestamp()] }).catch(() => {});
+      }
+      return;
+    }
+
     if (pendingRewards[userId]) {
       const p = pendingRewards[userId];
       await interaction.editReply({ content: `⏳ You already have a pending claim!\n\n**IGN:** ${p.ign} | **Invites:** ${p.invites} | **Reward:** ${p.invites * REWARD_PER_INVITE}m\n\nWait for it to be paid before claiming again.` });
@@ -948,11 +1000,11 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.reply({ content: "❌ Admins only.", ephemeral: true });
       return;
     }
-    const modal = new ModalBuilder().setCustomId("add_ban_modal").setTitle("Add Username Ban");
+    const modal = new ModalBuilder().setCustomId("add_ban_modal").setTitle("Ban a Minecraft IGN");
     modal.addComponents(
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId("ban_username").setLabel("Discord Username (exact)")
-          .setStyle(TextInputStyle.Short).setPlaceholder("e.g. steve123").setRequired(true)
+        new TextInputBuilder().setCustomId("ban_username").setLabel("Minecraft IGN (exact, case-insensitive)")
+          .setStyle(TextInputStyle.Short).setPlaceholder("e.g. Steve123").setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder().setCustomId("ban_reason").setLabel("Reason")
