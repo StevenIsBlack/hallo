@@ -1315,4 +1315,6 @@ function chunkArray(arr, size) {
   return out;
 }
 
-client.login(BOT_TOKEN);
+client.login(BOT_TOKEN).catch(err => {
+  console.error("LOGIN ERROR:", err);
+});
