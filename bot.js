@@ -1315,5 +1315,4 @@ function chunkArray(arr, size) {
   return out;
 }
 
-console.log("BOT TOKEN EXISTS:", !!BOT_TOKEN);
 client.login(BOT_TOKEN);
