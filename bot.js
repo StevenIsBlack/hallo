@@ -1064,26 +1064,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Minimum server membership check (24 hours) ───────────────────────────
-    const member = await interaction.guild.members.fetch(userId).catch(() => null);
-    if (member) {
-      const joinedAt   = member.joinedTimestamp;
-      const hoursInServer = (Date.now() - joinedAt) / (1000 * 60 * 60);
-      if (hoursInServer < 24) {
-        const hoursLeft = Math.ceil(24 - hoursInServer);
-        await interaction.editReply({
-          content:
-            `⏳ **You need to be in the server for at least 24 hours before claiming rewards.**
-
-` +
-            `You joined **${Math.floor(hoursInServer)} hour${Math.floor(hoursInServer) === 1 ? "" : "s"}** ago.
-` +
-            `Come back in **${hoursLeft} hour${hoursLeft === 1 ? "" : "s"}**!`,
-        });
-        return;
-      }
-    }
-
     if (pendingRewards[userId]) {
       const p = pendingRewards[userId];
       await interaction.editReply({ content: `⏳ You already have a pending claim!\n\n**IGN:** ${p.ign} | **Invites:** ${p.invites} | **Reward:** ${p.invites * REWARD_PER_INVITE}m\n\nWait for it to be paid before claiming again.` });
@@ -1315,6 +1295,4 @@ function chunkArray(arr, size) {
   return out;
 }
 
-client.login(BOT_TOKEN).catch(err => {
-  console.error("LOGIN ERROR:", err);
-});
+client.login(BOT_TOKEN);
