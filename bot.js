@@ -881,23 +881,8 @@ async function spawnMinecraftBot(feedbackChannel) {
       console.error("Minecraft bot error:", err.message);
       const ch = await client.channels.fetch(REWARD_LOG_CHANNEL_ID).catch(() => null);
 
-      // If account is suspended, don't retry — alert admin
-      if (err.message.includes("ACCOUNT_SUSPENDED") || err.message.includes("suspended")) {
-        console.error("🚨 Microsoft account suspended — not retrying. Get a new Minecraft account.");
-        if (ch) await ch.send(
-          `🚨 **Minecraft account suspended by Microsoft!**
-
-` +
-          `The account **${MC_USERNAME}** has been suspended — this is why the bot stopped working.
-
-` +
-          `**Fix:** Get a new Minecraft Java account, update \`MC_USERNAME\` in Railway variables, then type \`!clearauth\`.`
-        ).catch(() => {});
-        return; // Don't reconnect
-      }
-
       // If rate limited, wait longer before retrying
-      const retryDelay = err.message.includes("429") ? 300000 : 30000; // 5 min if rate limited
+      const retryDelay = err.message.includes("429") ? 300000 : 30000;
       if (ch) await ch.send(`❌ Minecraft bot error: \`${err.message}\` — reconnecting in ${retryDelay / 1000}s...`).catch(() => {});
       setTimeout(() => spawnMinecraftBot(null), retryDelay);
     });
