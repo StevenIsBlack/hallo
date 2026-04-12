@@ -55,7 +55,7 @@ const BURST_LIMIT           = 5;    // X invites in 60s = invites get reset
 const DAILY_LIMIT           = 20;   // 20+ invites in 24h = flagged
 const BOT_TOKEN             = process.env.BOT_TOKEN;
 const MC_USERNAME           = process.env.MC_USERNAME;
-const MC_HOST               = "donutsmp.net";
+const MC_HOST               = "eu.donutsmp.net";
 const MC_PORT               = 25565;
 // ──────────────────────────────────────────────────────────────────────────────
 
